@@ -1,0 +1,10 @@
+# Runtime
+PySide6==6.11.2
+sounddevice==0.5.6
+requests==2.34.2
+
+# Build
+pyinstaller==6.22.2
+
+# Tests
+pytest==9.1.1
