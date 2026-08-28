@@ -44,8 +44,31 @@ class Recorder:
         self.events.append("cancel")
 
 
+class FakeKeyboard:
+    """Physical key state, the seam the listener asks instead of Windows.
+
+    Every test drives the listener through this instead of the real
+    keyboard: the default off-Windows implementation of the seam answers
+    "held" for everything, which happens to match Linux's usual test setup
+    but not Windows', where nothing is actually held. Routing every test
+    through a fake keeps the suite's result independent of the OS it runs on.
+    """
+
+    def __init__(self):
+        self.down: set[int] = set()
+
+    def is_down(self, vk: int) -> bool:
+        return vk in self.down
+
+
 def make_listener(text="ctrl+alt+space", is_key_down=None):
     events = Recorder()
+    keyboard = None
+    if is_key_down is None:
+        # No fake of its own was supplied - build one and have down()/up()
+        # below keep it in sync with what the test presses and releases.
+        keyboard = FakeKeyboard()
+        is_key_down = keyboard.is_down
     listener = HotkeyListener(
         parse(text),
         events.press,
@@ -53,14 +76,21 @@ def make_listener(text="ctrl+alt+space", is_key_down=None):
         on_cancel=events.cancel,
         is_key_down=is_key_down,
     )
+    listener._test_keyboard = keyboard
     return listener, events
 
 
 def down(listener, vk, flags=0):
+    keyboard = getattr(listener, "_test_keyboard", None)
+    if keyboard is not None:
+        keyboard.down.add(vk)
     return listener._handle_key(vk, WM_KEYDOWN, flags)
 
 
 def up(listener, vk, flags=0):
+    keyboard = getattr(listener, "_test_keyboard", None)
+    if keyboard is not None:
+        keyboard.down.discard(vk)
     return listener._handle_key(vk, WM_KEYUP, flags)
 
 
@@ -395,7 +425,11 @@ def test_the_modifier_hotkey_works_again_after_a_cancelled_take():
 def test_a_cancelled_take_fires_the_release_when_there_is_no_cancel_handler():
     """app.py passes two callbacks only; the take must still be stopped."""
     events = Recorder()
-    listener = HotkeyListener(parse("rctrl"), events.press, events.release)
+    keyboard = FakeKeyboard()
+    listener = HotkeyListener(
+        parse("rctrl"), events.press, events.release, is_key_down=keyboard.is_down
+    )
+    listener._test_keyboard = keyboard
     down(listener, VK_RCONTROL)
     down(listener, VK_A)
     assert events.events == ["press", "release"]
@@ -424,16 +458,6 @@ def test_switching_to_a_modifier_hotkey_does_not_arm_on_auto_repeat():
 
 
 # --------------------------------- recovery from a key-up that never arrived
-class FakeKeyboard:
-    """Physical key state, the seam the listener asks instead of Windows."""
-
-    def __init__(self):
-        self.down: set[int] = set()
-
-    def is_down(self, vk: int) -> bool:
-        return vk in self.down
-
-
 def test_a_lost_modifier_key_up_does_not_kill_the_hotkey():
     """A UAC prompt can swallow the key-up; the next press must still work."""
     keyboard = FakeKeyboard()
