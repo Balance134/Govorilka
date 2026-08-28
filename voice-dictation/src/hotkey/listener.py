@@ -78,6 +78,8 @@ if _IS_WINDOWS:  # pragma: no cover - Windows only
         wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
     ]
     user32.PostThreadMessageW.restype = wintypes.BOOL
+    user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    user32.GetAsyncKeyState.restype = ctypes.c_short
     kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
 
@@ -90,7 +92,9 @@ class HotkeyListener:
 
     A modifier-only hotkey (right Ctrl held on its own) is driven by the
     modifier itself and is passed through to the focused application, so the
-    key keeps doing its usual job in Ctrl+C.
+    key keeps doing its usual job in Ctrl+C. When a regular key joins it the
+    hold was a shortcut after all and ``on_cancel`` fires instead of
+    ``on_release``, so nothing gets transcribed.
     """
 
     def __init__(
@@ -98,10 +102,18 @@ class HotkeyListener:
         hotkey: Hotkey,
         on_press: Callable[[], None],
         on_release: Callable[[], None],
+        on_cancel: Optional[Callable[[], None]] = None,
+        is_key_down: Optional[Callable[[int], bool]] = None,
     ) -> None:
         self._hotkey = hotkey
         self._on_press = on_press
         self._on_release = on_release
+        # Fired instead of on_release when the take turns out to be a
+        # shortcut (right Ctrl held for Ctrl+C) - nothing said belongs to a
+        # dictation then. Without a handler of its own the take is simply
+        # stopped, which is still better than transcribing it.
+        self._on_cancel = on_cancel if on_cancel is not None else on_release
+        self._is_key_down = is_key_down if is_key_down is not None else _key_is_down
         self._thread: Optional[threading.Thread] = None
         self._thread_id: int = 0
         self._hook = None
@@ -261,21 +273,22 @@ class HotkeyListener:
             # back through this hook; they must not move the state machine.
             return False
 
-        swallow, callback = self._decide(vk, message)
-        if callback is not None:
+        swallow, callbacks = self._decide(vk, message)
+        for callback in callbacks:
             self._fire(callback)
         return swallow
 
     def _decide(
         self, vk: int, message: int
-    ) -> tuple[bool, Optional[Callable[[], None]]]:
+    ) -> tuple[bool, list[Callable[[], None]]]:
         is_down = message in (WM_KEYDOWN, WM_SYSKEYDOWN)
         is_up = message in (WM_KEYUP, WM_SYSKEYUP)
         if not (is_down or is_up):
-            return False, None
+            return False, []
 
         with self._lock:
             hotkey = self._hotkey
+            recovered = self._forget_lost_modifiers(vk)
 
             if vk in ALL_MODIFIER_VKS:
                 if is_down:
@@ -292,15 +305,15 @@ class HotkeyListener:
                         # Never swallowed: the key must keep working as a
                         # normal modifier, or every shortcut on that side of
                         # the keyboard dies.
-                        return False, self._on_press
-                    return False, None
+                        return False, recovered + [self._on_press]
+                    return False, recovered
                 self._pressed_modifier_vks.discard(vk)
                 # Releasing a required modifier ends the hold; a foreign one
                 # (Shift under Ctrl+Alt+Space) leaves the hold alone.
                 if self._held and vk in hotkey.all_modifier_vks():
                     self._held = False
-                    return False, self._on_release
-                return False, None
+                    return False, recovered + [self._on_release]
+                return False, recovered
 
             if is_down:
                 repeat = vk in self._down_keys
@@ -309,26 +322,63 @@ class HotkeyListener:
                 repeat = False
                 self._down_keys.discard(vk)
 
+            if is_down and self._held and hotkey.is_modifier_only:
+                # The modifier turned out to be the modifier of a shortcut:
+                # right Ctrl plus C is a copy, not a dictation. Drop the take
+                # instead of transcribing whatever was said before it.
+                self._held = False
+                return False, recovered + [self._on_cancel]
+
             if vk != hotkey.key_vk:
-                return False, None
+                return False, recovered
 
             if is_down:
                 if self._held:
-                    return True, None  # auto-repeat: swallow, but do not re-fire
+                    return True, recovered  # auto-repeat: swallow, do not re-fire
                 if repeat:
                     # The key was already down before this combination was
                     # armed - wait for a real press instead of a phantom one.
-                    return False, None
+                    return False, recovered
                 if not self._modifiers_satisfied(hotkey):
-                    return False, None
+                    return False, recovered
                 self._held = True
-                return True, self._on_press
+                return True, recovered + [self._on_press]
 
             # key up
             if self._held:
                 self._held = False
-                return True, self._on_release
-            return False, None
+                return True, recovered + [self._on_release]
+            return False, recovered
+
+    def _forget_lost_modifiers(self, current_vk: int) -> list[Callable[[], None]]:
+        """Drop modifiers Windows no longer sees as held.
+
+        A key-up can go missing: a UAC prompt or a hook above ours swallows
+        it, and the tracked set then keeps a key that has long been up, so the
+        hotkey never arms again. The key of the event in hand is left alone -
+        the branches below are what decide its meaning.
+        """
+        stale = {
+            vk
+            for vk in self._pressed_modifier_vks
+            if vk != current_vk and not self._key_looks_held(vk)
+        }
+        if not stale:
+            return []
+        log.warning("Modifiers held in our state but up in Windows: %s", sorted(stale))
+        self._pressed_modifier_vks -= stale
+        if self._held and stale & self._hotkey.all_modifier_vks():
+            self._held = False
+            return [self._on_release]
+        return []
+
+    def _key_looks_held(self, vk: int) -> bool:
+        """True when the key looks held; any failure keeps the tracked state."""
+        try:
+            return bool(self._is_key_down(vk))
+        except Exception:
+            log.exception("Key state check failed")
+            return True
 
     def _modifiers_satisfied(self, hotkey: Hotkey) -> bool:
         for name in hotkey.modifiers:
@@ -350,6 +400,18 @@ class HotkeyListener:
             callback()
         except Exception:
             log.exception("Hotkey callback failed")
+
+
+def _key_is_down(vk: int) -> bool:
+    """Physical state of a key, or "held" where Windows cannot be asked.
+
+    GetAsyncKeyState answers about the hardware right now, which is what the
+    reconciliation needs: the state machine may have missed the key-up long
+    ago. It is a seam so the decision logic stays testable off Windows.
+    """
+    if not _IS_WINDOWS:
+        return True
+    return bool(user32.GetAsyncKeyState(vk) & 0x8000)  # pragma: no cover
 
 
 def _family_of_vk(vk: int) -> str | None:

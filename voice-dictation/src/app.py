@@ -18,15 +18,20 @@ from PySide6.QtCore import (
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .app_logic import (
+    CLIPBOARD_ONLY_NOTICE,
     DictationTimings,
-    LATE_RESULT_NOTICE,
     MAX_RECORDING_MS,
+    NOT_INSERTED_BASE,
     TakeGuard,
     TextOutcome,
     busy_message,
+    capture_target_window,
     decide_stop,
     decide_text_ready,
+    late_result_notice,
     safe_apply_replacements,
+    timings_belong_to,
+    with_history_hint,
 )
 from .audio import sounds
 from .audio.recorder import (
@@ -36,7 +41,7 @@ from .audio.recorder import (
     is_too_short,
     wav_duration_seconds,
 )
-from .config import store
+from .config import history, store
 from .config.model import AppConfig
 from .config.vocabulary import build_api_vocabulary
 from .gemini.client import GeminiClient
@@ -45,6 +50,7 @@ from .hotkey.listener import HotkeyListener
 from .hotkey.parser import HotkeyError, parse as parse_hotkey
 from .injection import focus, typer
 from .tray.tray_icon import TrayIcon, app_icon
+from .ui.history_window import HistoryWindow
 from .ui.level_indicator import LevelIndicator
 from .ui.settings_window import SettingsWindow
 from .utils import logging_setup, single_instance
@@ -192,6 +198,8 @@ class DictationApp(QObject):
     # Hook callbacks arrive on the hook thread; these signals move them to GUI.
     hotkeyPressed = Signal()
     hotkeyReleased = Signal()
+    # A modifier-only hotkey turned out to be part of an ordinary shortcut.
+    hotkeyCancelled = Signal()
     # Unhandled errors are reported from arbitrary threads; the tray balloon
     # may only be touched on the GUI thread, so they travel through a signal.
     errorReported = Signal(str)
@@ -208,6 +216,9 @@ class DictationApp(QObject):
         self._inject_worker: InjectWorker | None = None
         self._take = TakeGuard()
         self._timings: DictationTimings | None = None
+        # Transcript of the take being injected, waiting to be written to the
+        # history once its outcome is known.
+        self._pending_text = ""
         self._shutting_down = False
 
         # The indicator is a comfort, never a requirement: dictation has to
@@ -219,20 +230,25 @@ class DictationApp(QObject):
             log.exception("Could not create the recording indicator")
 
         icon = app_icon()
+        self._icon = icon
         self._tray = TrayIcon(self)
         self._tray.settingsRequested.connect(self.show_settings)
+        self._tray.historyRequested.connect(self.show_history)
         self._tray.exitRequested.connect(self.quit)
         self._tray.iconActivated.connect(self._on_tray_activated)
         self._tray.show()
 
         self._settings = SettingsWindow(self._config, icon)
         self._settings.settingsSaved.connect(self._on_settings_saved)
+        # Built on the first "История" click, so startup stays as fast as it is.
+        self._history_window: HistoryWindow | None = None
 
         self.errorReported.connect(self._tray.notify, Qt.QueuedConnection)
         logging_setup.set_notifier(self.errorReported.emit)
 
         self.hotkeyPressed.connect(self._start_recording, Qt.QueuedConnection)
         self.hotkeyReleased.connect(self._stop_recording, Qt.QueuedConnection)
+        self.hotkeyCancelled.connect(self._cancel_recording, Qt.QueuedConnection)
 
         self._recording_timer = self._make_timer(
             MAX_RECORDING_MS, self._on_recording_timeout
@@ -303,6 +319,7 @@ class DictationApp(QObject):
                 hotkey,
                 on_press=self.hotkeyPressed.emit,
                 on_release=self.hotkeyReleased.emit,
+                on_cancel=self.hotkeyCancelled.emit,
             )
         listener = self._listener
         listener.set_hotkey(hotkey)
@@ -337,6 +354,46 @@ class DictationApp(QObject):
         self._settings.raise_()
         self._settings.activateWindow()
 
+    # -------------------------------------------------------------- history
+    def show_history(self) -> None:
+        """Opened by an explicit tray click, so taking the focus is correct
+        here: a dictation in flight types into the window it remembered when
+        the hotkey went down, not into whatever is focused now."""
+        if self._shutting_down:
+            return
+        if self._history_window is None:
+            try:
+                self._history_window = HistoryWindow(self._icon)
+            except Exception:
+                log.exception("Could not create the history window")
+                self._tray.notify("Не удалось открыть историю")
+                return
+        window = self._history_window
+        window.reload()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _record_pending(self, outcome: str) -> bool:
+        """Stores the transcript that was handed to the injection worker."""
+        text = self._pending_text
+        self._pending_text = ""
+        return self._record_dictation(text, outcome)
+
+    def _record_dictation(self, text: str, outcome: str) -> bool:
+        """Stores one transcript. A failure here is logged and forgotten: the
+        dictation itself already happened."""
+        if not text:
+            return False
+        saved = history.add(text, outcome)
+        window = self._history_window
+        if saved and window is not None and window.isVisible():
+            try:
+                window.reload()
+            except Exception:
+                log.exception("Could not refresh the open history window")
+        return saved
+
     def _on_settings_saved(self, config: AppConfig) -> None:
         try:
             store.save(config)
@@ -358,9 +415,14 @@ class DictationApp(QObject):
         if self._state.is_busy():
             self._tray.notify(busy_message(self._state.state))
             return
+        # Read the target BEFORE the state change: the transition shows the
+        # recording overlay, and a window of ours must never become the target.
+        target_hwnd = capture_target_window(
+            focus.get_foreground_window, focus.belongs_to_this_process
+        )
         if not self._state.to(AppState.RECORDING):
             return
-        self._target_hwnd = focus.get_foreground_window()
+        self._target_hwnd = target_hwnd
         # Beep first: opening a WASAPI device takes up to a few hundred
         # milliseconds and the user needs the cue when the key goes down.
         sounds.play_start()
@@ -369,6 +431,19 @@ class DictationApp(QObject):
         except MicrophoneError as exc:
             self._fail(str(exc))
             return
+
+    def _cancel_recording(self) -> None:
+        """The hotkey turned out to be a shortcut's modifier: drop the take."""
+        if self._shutting_down:
+            return
+        if self._state.state != AppState.RECORDING:
+            return
+        try:
+            self._recorder.stop()
+        except Exception:
+            log.exception("Recorder failed to stop after a cancelled take")
+        self._timings = None
+        self._state.force_idle()
 
     def _stop_recording(self, timed_out: bool = False) -> None:
         if self._shutting_down:
@@ -400,6 +475,7 @@ class DictationApp(QObject):
         if outcome.notice:
             self._tray.notify(outcome.notice)
         if not outcome.transcribe:
+            self._log_timings(injected=False)
             self._state.force_idle()
             return
 
@@ -441,29 +517,39 @@ class DictationApp(QObject):
     # ------------------------------------------------------------ injection
     def _on_text_ready(self, text: str, generation: int) -> None:
         corrected = safe_apply_replacements(text, self._config.replacements)
-        if self._timings is not None:
-            self._timings.transcript_ready(len(corrected))
         outcome = decide_text_ready(
             self._shutting_down, self._take.is_current(generation), corrected
         )
+        if self._timings is not None and timings_belong_to(outcome):
+            self._timings.transcript_ready(len(corrected))
         if outcome is TextOutcome.DROP_SHUTDOWN:
-            log.info("Transcript arrived after shutdown, dropping it")
+            # Nothing may be typed or shown at this point, but a plain file
+            # write still works - and it is the only way the text survives.
+            log.info("Transcript arrived after shutdown, saving it to the history")
+            history.add(corrected, history.OUTCOME_SHUTDOWN)
             return
         if outcome is TextOutcome.DROP_LATE:
-            # The watchdog already told the user they may dictate again; a
-            # finished transcript is never dropped in silence.
-            log.warning("Transcript of an abandoned take arrived, dropping it")
-            self._tray.notify(LATE_RESULT_NOTICE)
+            # The take was abandoned, but the transcript itself is fine: it
+            # goes to the history and the user is sent there to copy it.
+            log.warning("Transcript of an abandoned take arrived, saving it")
+            saved = self._record_dictation(corrected, history.OUTCOME_LATE)
+            self._tray.notify(late_result_notice(saved))
             return
         if outcome is TextOutcome.EMPTY:
-            self._fail("Речь не распознана")
+            self._fail("Речь не распознана")  # no text at all, nothing to store
             return
         if not self._state.to(AppState.TYPING):
+            # ERROR, or an IDLE the watchdog forced while the take still
+            # counted as current. Typing is refused, the text is not.
+            log.warning("Cannot type from %s, saving the transcript", self._state.state)
+            saved = self._record_dictation(corrected, history.OUTCOME_FAILED)
+            self._tray.notify(with_history_hint(NOT_INSERTED_BASE, saved))
             return
+        self._pending_text = corrected
         worker = InjectWorker(corrected, self._target_hwnd, self._config.paste_mode, self)
         worker.succeeded.connect(self._on_injected)
         worker.clipboardOnly.connect(self._on_clipboard_only)
-        worker.failed.connect(self._fail)
+        worker.failed.connect(self._on_inject_failed)
         worker.finished.connect(self._on_inject_finished)
         worker.finished.connect(worker.deleteLater)
         self._inject_worker = worker
@@ -472,7 +558,7 @@ class DictationApp(QObject):
         except Exception:
             log.exception("Could not start the injection thread")
             self._inject_worker = None
-            self._fail("Не удалось вставить текст")
+            self._on_inject_failed("Не удалось вставить текст")
 
     def _on_transcribe_failed(self, message: str, generation: int) -> None:
         if self._shutting_down:
@@ -484,27 +570,39 @@ class DictationApp(QObject):
         self._fail(message)
 
     def _on_injected(self) -> None:
+        # Saved even when the paste looked fine: the user cannot always tell at
+        # that moment whether the text landed where they expected.
+        self._record_pending(history.OUTCOME_INSERTED)
         if self._shutting_down:
             return
         self._log_timings()
         self._state.force_idle()
 
     def _on_clipboard_only(self) -> None:
+        saved = self._record_pending(history.OUTCOME_CLIPBOARD)
         if self._shutting_down:
             return
         self._log_timings()
         self._state.force_idle()
-        self._tray.notify(
-            "Не удалось определить поле ввода. Текст скопирован в буфер обмена"
-        )
+        self._tray.notify(with_history_hint(CLIPBOARD_ONLY_NOTICE, saved))
 
-    def _log_timings(self) -> None:
-        """One line per finished dictation: where the wait actually went."""
-        if self._timings is None:
-            return
-        self._timings.injected()
-        log.info("%s", self._timings.as_line())
+    def _on_inject_failed(self, message: str) -> None:
+        saved = self._record_pending(history.OUTCOME_FAILED)
+        self._fail(with_history_hint(message, saved))
+
+    def _log_timings(self, injected: bool = True) -> None:
+        """One line per dictation, failures included: where the wait went.
+
+        A take that failed is exactly the one worth measuring, so the stages it
+        never reached are printed as "?" instead of being left out entirely.
+        """
+        timings = self._timings
         self._timings = None
+        if timings is None:
+            return
+        if injected:
+            timings.injected()
+        log.info("%s", timings.as_line())
 
     # ----------------------------------------------------------- worker ends
     def _on_transcribe_finished(self) -> None:
@@ -530,6 +628,7 @@ class DictationApp(QObject):
         if self._shutting_down:
             log.warning("Error after shutdown, not shown: %s", message)
             return
+        self._log_timings(injected=False)
         self._recorder.abort()
         self._state.to(AppState.ERROR)
         self._tray.notify(message)
@@ -555,23 +654,33 @@ class DictationApp(QObject):
 
     # ------------------------------------------------------------ indicator
     def _show_indicator(self, visible: bool) -> None:
-        if self._indicator is None:
+        indicator = self._indicator
+        if indicator is None:
             return
         try:
             if visible and not self._shutting_down:
-                self._indicator.start()
+                indicator.start()
             else:
-                self._indicator.stop()
+                indicator.stop()
         except Exception:
             log.exception("Recording indicator failed, carrying on without it")
             self._indicator = None
+            # A failure inside stop() would otherwise strand an always-on-top
+            # overlay on the desktop with nothing left holding a reference.
+            try:
+                indicator.hide()
+                indicator.close()
+            except Exception:
+                log.debug("Could not hide the failed indicator", exc_info=True)
 
     def _close_indicator(self) -> None:
         indicator = self._indicator
         self._indicator = None
         if indicator is not None:
             indicator.stop()
-            indicator.deleteLater()
+            # Not deleteLater(): the loop is already past processing deferred
+            # deletes by the time cleanup runs.
+            indicator.close()
 
     # ------------------------------------------------------------- shutdown
     def quit(self) -> None:
@@ -598,6 +707,7 @@ class DictationApp(QObject):
             self._disconnect_signals,
             self._settings.close,
             self._settings.deleteLater,
+            self._close_history_window,
             self._tray.hide,
         ):
             try:
@@ -608,6 +718,13 @@ class DictationApp(QObject):
             self._force_exit()
         self._client.close()  # only now: nobody is using the session anymore
 
+    def _close_history_window(self) -> None:
+        window = self._history_window
+        self._history_window = None
+        if window is not None:
+            window.close()
+            window.deleteLater()
+
     def _stop_listener(self) -> None:
         if self._listener is not None:
             self._listener.stop()
@@ -616,6 +733,7 @@ class DictationApp(QObject):
     def _disconnect_signals(self) -> None:
         try:
             self._tray.settingsRequested.disconnect()
+            self._tray.historyRequested.disconnect()
             self._tray.exitRequested.disconnect()
             self._tray.iconActivated.disconnect()
             self._settings.settingsSaved.disconnect()

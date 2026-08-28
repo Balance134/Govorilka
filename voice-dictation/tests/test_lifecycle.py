@@ -9,6 +9,7 @@ the decisions their slots make are kept.
 
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -20,22 +21,29 @@ if "sounddevice" not in sys.modules:  # pragma: no cover - depends on the box
 from src import app_logic
 from src.app_logic import (
     BAR_COUNT,
+    CLIPBOARD_ONLY_NOTICE,
+    HISTORY_HINT,
     BAR_DECAY_PER_FRAME,
     BAR_FLOOR,
     DictationTimings,
     IDLE_BARS,
     LATE_RESULT_NOTICE,
+    LATE_RESULT_RETRY,
     MAX_RECORDING_MS,
     StopOutcome,
     TakeGuard,
     TextOutcome,
     busy_message,
+    capture_target_window,
     decide_stop,
     decide_text_ready,
     format_timings,
+    late_result_notice,
     next_bar_heights,
     peak_to_level,
     safe_apply_replacements,
+    timings_belong_to,
+    with_history_hint,
 )
 from src.audio import recorder as recorder_module
 from src.audio.recorder import (
@@ -394,7 +402,9 @@ def test_the_scale_is_logarithmic_not_linear():
 
 
 def test_a_barely_audible_sample_counts_as_silence():
-    assert peak_to_level(5) == 0.0
+    """Just below the -55 dB floor is still silence, just above it is not."""
+    assert peak_to_level(58) == 0.0
+    assert peak_to_level(59) > 0.0
 
 
 def test_silence_leaves_every_bar_on_the_floor():
@@ -421,7 +431,7 @@ def test_the_bars_are_not_all_the_same_height():
 def test_a_bar_falls_by_one_step_per_frame_instead_of_dropping_out():
     full = (1.0,) * BAR_COUNT
     after = next_bar_heights(full, 0.0, frame=0)
-    assert all(bar == pytest.approx(1.0 - BAR_DECAY_PER_FRAME) for bar in after)
+    assert all(bar == pytest.approx(0.91) for bar in after)  # one 0.09 step
     assert all(bar > BAR_FLOOR for bar in after)
 
 
@@ -436,6 +446,22 @@ def test_a_bar_rises_at_once_when_the_voice_comes_back():
     quiet = next_bar_heights(IDLE_BARS, 0.0, frame=0)
     loud = next_bar_heights(quiet, 1.0, frame=0)
     assert max(loud) > 0.5  # attack is immediate, only the fall is smoothed
+
+
+def test_the_ripple_steps_one_slot_per_bar_so_no_two_bars_are_locked():
+    """With a step of two only half the ripple was ever used and bars 0/3, 1/4
+    and 2/5 moved as one."""
+    bars = next_bar_heights(IDLE_BARS, 1.0, frame=0)
+    used = sorted(
+        round((bar - BAR_FLOOR) / ((1.0 - BAR_FLOOR) * shape), 3)
+        for bar, shape in zip(bars, app_logic.BAR_SHAPE)
+    )
+    assert used == sorted(round(step, 3) for step in app_logic.BAR_RIPPLE)
+
+
+def test_the_bar_tables_are_the_length_of_the_row():
+    assert len(app_logic.BAR_SHAPE) == BAR_COUNT
+    assert len(app_logic.BAR_RIPPLE) == BAR_COUNT
 
 
 def test_out_of_range_levels_are_clamped():
@@ -471,3 +497,111 @@ def test_the_timing_line_never_carries_the_transcript():
     timings.injected()
     assert "секретный" not in timings.as_line()
     assert "chars=26" in timings.as_line()
+
+
+# ---------------------------------------------------------------- history
+def test_a_failed_paste_points_at_the_history():
+    message = with_history_hint("Не удалось вставить текст", saved=True)
+    assert message == "Не удалось вставить текст. Текст сохранён в истории"
+
+
+def test_the_clipboard_notice_points_at_the_history_too():
+    message = with_history_hint(CLIPBOARD_ONLY_NOTICE, saved=True)
+    assert message.startswith(CLIPBOARD_ONLY_NOTICE)
+    assert message.endswith(HISTORY_HINT)
+
+
+def test_a_message_ending_in_a_dot_does_not_get_two():
+    assert with_history_hint("Ошибка.", saved=True) == "Ошибка. Текст сохранён в истории"
+
+
+def test_the_history_is_never_promised_when_it_was_not_written():
+    assert with_history_hint("Не удалось вставить текст", saved=False) == (
+        "Не удалось вставить текст"
+    )
+
+
+def test_an_empty_message_becomes_the_hint_alone():
+    assert with_history_hint("  ", saved=True) == HISTORY_HINT
+
+
+def test_a_late_transcript_sends_the_user_to_the_history():
+    message = late_result_notice(saved=True)
+    assert message == LATE_RESULT_NOTICE
+    assert message.endswith(HISTORY_HINT)
+    assert "Продиктуйте ещё раз" not in message
+
+
+def test_a_late_transcript_that_could_not_be_saved_still_asks_for_a_retry():
+    assert late_result_notice(saved=False) == LATE_RESULT_RETRY
+    assert "Продиктуйте ещё раз" in LATE_RESULT_RETRY
+
+
+# --------------------------------- #1 the transcript never goes into our own
+def app_source(method: str) -> str:
+    """Body of one coordinator method as text.
+
+    `src.app` needs PySide6, which the suite must never require, so the two
+    orderings a dictation depends on are pinned by reading the source.
+    """
+    source = (Path(__file__).resolve().parents[1] / "src" / "app.py").read_text(
+        encoding="utf-8"
+    )
+    start = source.index(f"    def {method}(")
+    end = source.index("\n    def ", start + 1)
+    return source[start:end]
+
+
+def test_the_target_window_is_read_before_the_overlay_is_shown():
+    """The state change shows the overlay synchronously: read the foreground
+    window afterwards and our own overlay becomes the injection target."""
+    body = app_source("_start_recording")
+    assert body.index("capture_target_window") < body.index("AppState.RECORDING")
+
+
+def test_a_window_of_ours_is_never_the_injection_target():
+    ours = capture_target_window(lambda: 4321, lambda hwnd: True)
+    assert ours == 0  # 0 sends the text to the clipboard instead
+
+
+def test_a_foreign_window_is_kept_as_the_target():
+    assert capture_target_window(lambda: 4321, lambda hwnd: False) == 4321
+
+
+def test_no_foreground_window_at_all_is_not_a_target():
+    assert capture_target_window(lambda: 0, lambda hwnd: False) == 0
+
+
+# ---------------------------------- #4 a late transcript owns no stopwatch
+def test_a_late_transcript_does_not_touch_the_current_timings():
+    assert not timings_belong_to(TextOutcome.DROP_LATE)
+    assert not timings_belong_to(TextOutcome.DROP_SHUTDOWN)
+
+
+def test_the_transcript_of_the_current_take_does_stop_the_clock():
+    assert timings_belong_to(TextOutcome.INJECT)
+    assert timings_belong_to(TextOutcome.EMPTY)  # an empty take is measured too
+
+
+def test_the_take_is_checked_before_the_stopwatch_is_written():
+    body = app_source("_on_text_ready")
+    assert body.index("decide_text_ready") < body.index("transcript_ready")
+
+
+# ------------------------------------- #3 a failed dictation is measured too
+def test_a_failure_prints_the_timings_with_the_missing_stages_unknown():
+    ticks = iter([100.0, 102.0])
+    timings = DictationTimings(3.0, clock=lambda: next(ticks))
+    timings.transcript_ready(chars=0)
+    assert timings.as_line() == (
+        "dictation timings: audio=3.0s transcribe=2.0s inject=? chars=0"
+    )
+
+
+def test_every_ending_of_a_dictation_logs_the_timings():
+    """A take that was too short, failed to transcribe or failed to paste is
+    the one worth measuring, so `_fail` and the short-take path log as well."""
+    for method in ("_fail", "_stop_recording"):
+        assert "_log_timings(injected=False)" in app_source(method)
+    assert "_log_timings()" in app_source("_on_injected")
+    assert "_log_timings()" in app_source("_on_clipboard_only")

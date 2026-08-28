@@ -45,6 +45,7 @@ def app_icon() -> QIcon:
 
 class TrayIcon(QObject):
     settingsRequested = Signal()
+    historyRequested = Signal()
     exitRequested = Signal()
     iconActivated = Signal()
 
@@ -57,9 +58,12 @@ class TrayIcon(QObject):
         menu = QMenu()
         settings_action = QAction("Настройки", menu)
         settings_action.triggered.connect(self.settingsRequested.emit)
+        history_action = QAction("История", menu)
+        history_action.triggered.connect(self.historyRequested.emit)
         exit_action = QAction("Выход", menu)
         exit_action.triggered.connect(self.exitRequested.emit)
         menu.addAction(settings_action)
+        menu.addAction(history_action)
         menu.addSeparator()
         menu.addAction(exit_action)
         self._menu = menu  # keep a reference, Qt does not own it

@@ -14,6 +14,7 @@ from ..hotkey.parser import (
     FAMILY_SIDE_VKS,
     Hotkey,
     HotkeyError,
+    collapse_altgr,
     from_parts,
     key_token_to_vk,
     parse,
@@ -123,7 +124,23 @@ class HotkeyEdit(QLineEdit):
         self._chord_has_regular_key = False
         self.set_hotkey_text(hotkey_text)
 
+    def _reset_chord(self) -> None:
+        """Forget the combination being held.
+
+        Windows swallows the key-up of Alt on Alt+Tab and of the Windows key
+        when the Start menu opens, so the set of held modifiers can never be
+        trusted to empty itself. Anything that ends the capture - a lost
+        focus, a new value from the settings - starts from a clean slate,
+        otherwise one lost key-up kills the field until the app restarts.
+        """
+        self._modifiers_down.clear()
+        self._chord_modifiers = []
+        self._chord_unnamed_families = []
+        self._chord_has_unknown_modifier = False
+        self._chord_has_regular_key = False
+
     def set_hotkey_text(self, text: str) -> None:
+        self._reset_chord()
         try:
             self._hotkey = parse(text)
             self.setText(self._hotkey.to_string())
@@ -134,8 +151,19 @@ class HotkeyEdit(QLineEdit):
     def hotkey_text(self) -> str:
         return self.text().strip()
 
+    def focusOutEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        """Alt+Tab takes the focus and eats the Alt key-up; drop the chord."""
+        self._restore_dangling_preview()
+        self._reset_chord()
+        super().focusOutEvent(event)
+
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 - Qt naming
         key = event.key()
+        if not self._modifiers_down:
+            # Nothing is held, so whatever the last chord left behind is
+            # stale - a bare letter typed into the field must not disable the
+            # next capture.
+            self._reset_chord()
         if key in _MODIFIER_KEYS:
             self._remember_modifier(event)
             self.setText(self._modifier_preview(event) + "…")
@@ -177,27 +205,36 @@ class HotkeyEdit(QLineEdit):
             return
 
         committed = self._finish_chord()
-        # A dangling "ctrl+alt+…" preview would look broken; restore the value.
-        if not committed and self.text().endswith("…"):
-            self.setText(self._hotkey.to_string() if self._hotkey else "")
-        self._chord_modifiers = []
-        self._chord_unnamed_families = []
-        self._chord_has_unknown_modifier = False
-        self._chord_has_regular_key = False
+        if not committed:
+            self._restore_dangling_preview()
+        self._reset_chord()
         event.accept()
+
+    def _restore_dangling_preview(self) -> None:
+        """A leftover "ctrl+alt+…" would look broken and cannot be saved."""
+        if self.text().endswith("…"):
+            self.setText(self._hotkey.to_string() if self._hotkey else "")
 
     def _finish_chord(self) -> bool:
         """Modifiers only, and exactly one of them - that is the hotkey."""
         if self._chord_has_regular_key or self._chord_has_unknown_modifier:
             return False
-        if not self._chord_unnamed_families and len(self._chord_modifiers) == 1:
-            return self._commit_modifier_only(self._chord_modifiers[0])
-        if not self._chord_modifiers and len(set(self._chord_unnamed_families)) == 1:
+        named = collapse_altgr(self._chord_modifiers)
+        if not self._chord_unnamed_families and len(named) == 1:
+            return self._commit_modifier_only(named[0])
+        if not named and len(set(self._chord_unnamed_families)) == 1:
             # The user held one modifier and nothing could tell us the side.
             # Saying so beats committing the wrong key silently.
             self.captureFailed.emit(
                 side_required_message(self._chord_unnamed_families[0])
             )
+            return False
+        # Several modifiers and no key: nothing to save, and reverting the
+        # preview without a word looks like the field ignored the user.
+        self.captureFailed.emit(
+            "Как горячая клавиша подходит либо один модификатор, "
+            "либо сочетание с обычной клавишей"
+        )
         return False
 
     def _commit_modifier_only(self, name: str) -> bool:
@@ -212,6 +249,17 @@ class HotkeyEdit(QLineEdit):
 
     def _remember_modifier(self, event: QKeyEvent) -> None:
         self._modifiers_down.add(self._modifier_identity(event))
+        # The side is resolved from values Qt fills in itself; log the raw
+        # ones, so a wrong side can be read off the log instead of guessed.
+        log.debug(
+            "Modifier captured: key=%s vk=%s scancode=%s held=%s",
+            int(event.key()),
+            int(event.nativeVirtualKey() or 0),
+            int(event.nativeScanCode() or 0),
+            _held_sides(_QT_KEY_FAMILIES[event.key()])
+            if event.key() in _QT_KEY_FAMILIES
+            else (),
+        )
         family = _QT_KEY_FAMILIES.get(event.key())
         if family is None:
             self._chord_has_unknown_modifier = True  # Caps Lock is no hotkey

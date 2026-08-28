@@ -40,9 +40,19 @@ class Recorder:
         self.events.append("release")
 
 
-def make_listener(text="ctrl+alt+space"):
+    def cancel(self):
+        self.events.append("cancel")
+
+
+def make_listener(text="ctrl+alt+space", is_key_down=None):
     events = Recorder()
-    listener = HotkeyListener(parse(text), events.press, events.release)
+    listener = HotkeyListener(
+        parse(text),
+        events.press,
+        events.release,
+        on_cancel=events.cancel,
+        is_key_down=is_key_down,
+    )
     return listener, events
 
 
@@ -359,13 +369,46 @@ def test_the_modifier_hotkey_works_after_the_extra_modifier_is_released():
     assert events.events == ["press"]
 
 
-def test_a_regular_key_pressed_under_the_modifier_keeps_the_hold():
+# ---------------------------- a shortcut under the modifier is not a dictation
+def test_a_regular_key_pressed_under_the_modifier_cancels_the_take():
+    """Right Ctrl plus C is a copy: nothing said before it may be transcribed."""
+    listener, events = make_listener("rctrl")
+    down(listener, VK_RCONTROL)
+    assert down(listener, VK_A) is False  # the shortcut still reaches the app
+    assert events.events == ["press", "cancel"]
+    up(listener, VK_A)
+    up(listener, VK_RCONTROL)
+    assert events.events == ["press", "cancel"]  # no second stop
+
+
+def test_the_modifier_hotkey_works_again_after_a_cancelled_take():
     listener, events = make_listener("rctrl")
     down(listener, VK_RCONTROL)
     down(listener, VK_A)
     up(listener, VK_A)
-    assert events.events == ["press"]
     up(listener, VK_RCONTROL)
+    down(listener, VK_RCONTROL)
+    up(listener, VK_RCONTROL)
+    assert events.events == ["press", "cancel", "press", "release"]
+
+
+def test_a_cancelled_take_fires_the_release_when_there_is_no_cancel_handler():
+    """app.py passes two callbacks only; the take must still be stopped."""
+    events = Recorder()
+    listener = HotkeyListener(parse("rctrl"), events.press, events.release)
+    down(listener, VK_RCONTROL)
+    down(listener, VK_A)
+    assert events.events == ["press", "release"]
+
+
+def test_a_regular_key_under_a_combination_hotkey_is_not_a_cancel():
+    listener, events = make_listener()
+    down(listener, VK_LCONTROL)
+    down(listener, VK_LMENU)
+    down(listener, VK_SPACE)
+    down(listener, VK_A)  # typing while the combination is held
+    assert events.events == ["press"]
+    up(listener, VK_SPACE)
     assert events.events == ["press", "release"]
 
 
@@ -377,4 +420,73 @@ def test_switching_to_a_modifier_hotkey_does_not_arm_on_auto_repeat():
     assert events.events == []
     up(listener, VK_RCONTROL)
     assert down(listener, VK_RCONTROL) is False
+    assert events.events == ["press"]
+
+
+# --------------------------------- recovery from a key-up that never arrived
+class FakeKeyboard:
+    """Physical key state, the seam the listener asks instead of Windows."""
+
+    def __init__(self):
+        self.down: set[int] = set()
+
+    def is_down(self, vk: int) -> bool:
+        return vk in self.down
+
+
+def test_a_lost_modifier_key_up_does_not_kill_the_hotkey():
+    """A UAC prompt can swallow the key-up; the next press must still work."""
+    keyboard = FakeKeyboard()
+    listener, events = make_listener("rctrl", is_key_down=keyboard.is_down)
+    keyboard.down.add(VK_RCONTROL)
+    down(listener, VK_RCONTROL)
+    assert events.events == ["press"]
+
+    keyboard.down.discard(VK_RCONTROL)  # released while the hook was blind
+    down(listener, VK_A)  # any later event reconciles the tracked state
+    assert events.events == ["press", "release"]
+    assert listener._pressed_modifier_vks == set()
+
+    keyboard.down.add(VK_RCONTROL)
+    assert down(listener, VK_RCONTROL) is False
+    assert events.events == ["press", "release", "press"]
+
+
+def test_a_lost_key_up_of_a_combination_modifier_is_recovered_too():
+    keyboard = FakeKeyboard()
+    listener, events = make_listener(is_key_down=keyboard.is_down)
+    keyboard.down.update({VK_LCONTROL, VK_LMENU})
+    down(listener, VK_LCONTROL)
+    down(listener, VK_LMENU)
+    down(listener, VK_SPACE)
+    assert events.events == ["press"]
+
+    keyboard.down.discard(VK_LMENU)
+    up(listener, VK_SPACE)
+    assert events.events == ["press", "release"]
+
+    keyboard.down.update({VK_LCONTROL, VK_LMENU})
+    down(listener, VK_LMENU)
+    assert down(listener, VK_SPACE) is True
+    assert events.events == ["press", "release", "press"]
+
+
+def test_the_key_of_the_current_event_is_never_reconciled_away():
+    """Windows may not have updated the state yet when the hook runs."""
+    keyboard = FakeKeyboard()  # reports everything as up
+    listener, events = make_listener("rctrl", is_key_down=keyboard.is_down)
+    assert down(listener, VK_RCONTROL) is False
+    assert events.events == ["press"]
+    assert up(listener, VK_RCONTROL) is False
+    assert events.events == ["press", "release"]
+
+
+def test_a_failing_key_state_check_keeps_the_tracked_state():
+    def broken(vk):
+        raise OSError("GetAsyncKeyState failed")
+
+    listener, events = make_listener("rctrl", is_key_down=broken)
+    down(listener, VK_RCONTROL)
+    down(listener, VK_LSHIFT)  # forces a reconciliation pass
+    assert VK_RCONTROL in listener._pressed_modifier_vks
     assert events.events == ["press"]

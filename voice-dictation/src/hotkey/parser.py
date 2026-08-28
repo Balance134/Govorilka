@@ -262,6 +262,18 @@ def side_from_scancode(scancode: int) -> str | None:
     return side
 
 
+def collapse_altgr(names: Iterable[str]) -> list[str]:
+    """AltGr arrives as a synthetic left Ctrl plus the right Alt.
+
+    On a European layout one physical key press produces both, so a chord of
+    exactly these two is one modifier, not two.
+    """
+    ordered = list(dict.fromkeys(names))
+    if set(ordered) == {"lctrl", "ralt"}:
+        return ["ralt"]
+    return ordered
+
+
 def resolve_modifier_side(
     vk: int, scancode: int, held_sides: Iterable[str] = ()
 ) -> str | None:
@@ -337,6 +349,14 @@ def _modifier_only(modifiers: list[str]) -> Hotkey:
     name = names[0]
     if name not in SIDE_SPECIFIC_MODIFIERS:
         raise HotkeyError(side_required_message(MODIFIER_FAMILY[name]))
+    if MODIFIER_FAMILY[name] == "win":
+        # A modifier-only hotkey is never swallowed, so the release always
+        # reaches Windows and opens the Start menu - which takes the
+        # foreground away from the field the text was meant for.
+        raise HotkeyError(
+            "Клавиша Windows не подходит для диктовки в одиночку — "
+            "при отпускании открывается меню «Пуск» и забирает фокус"
+        )
     return Hotkey(modifiers=(name,), key="", key_vk=0)
 
 
@@ -378,6 +398,18 @@ def _reject_system_combinations(hotkey: Hotkey) -> None:
 
 
 def warnings_for(hotkey: Hotkey) -> list[str]:
+    if hotkey.is_modifier_only:
+        name = hotkey.modifiers[0]
+        if name == "ralt":
+            return [
+                "Правый Alt на европейских раскладках работает как AltGr: "
+                "пока он удерживается, не набрать @, € и #"
+            ]
+        if name == "lalt":
+            return [
+                "Левый Alt в одиночку открывает меню окна — возможны конфликты"
+            ]
+        return []
     families = {MODIFIER_FAMILY[name] for name in hotkey.modifiers}
     if families == {"alt"} and hotkey.key == "space":
         return [

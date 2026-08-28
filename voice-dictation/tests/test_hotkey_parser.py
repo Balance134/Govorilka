@@ -13,6 +13,7 @@ from src.hotkey.parser import (
     resolve_modifier_side,
     side_required_message,
     vk_to_key_token,
+    collapse_altgr,
     warnings_for,
 )
 
@@ -146,7 +147,7 @@ def test_equals_sign_stays_the_canonical_name_for_that_key():
 
 # ------------------------------------- a single side-specific modifier hotkey
 @pytest.mark.parametrize(
-    "text", ["rctrl", "lctrl", "ralt", "lalt", "rshift", "lshift", "rwin", "lwin"]
+    "text", ["rctrl", "lctrl", "ralt", "lalt", "rshift", "lshift"]
 )
 def test_a_single_side_specific_modifier_is_a_hotkey(text):
     hotkey = parse(text)
@@ -159,6 +160,29 @@ def test_a_single_side_specific_modifier_is_a_hotkey(text):
 def test_modifier_only_hotkey_triggers_on_its_own_vk():
     assert parse("rctrl").trigger_vk == VK_RCONTROL
     assert parse("ctrl+alt+space").trigger_vk == 0x20
+
+
+@pytest.mark.parametrize("text", ["lwin", "rwin"])
+def test_the_windows_key_alone_is_refused(text):
+    """Releasing it opens the Start menu, which takes the focus mid-dictation."""
+    with pytest.raises(HotkeyError, match="меню «Пуск»"):
+        parse(text)
+    with pytest.raises(HotkeyError, match="меню «Пуск»"):
+        from_parts([text])
+
+
+def test_a_single_alt_is_allowed_but_warned_about():
+    assert "AltGr" in warnings_for(parse("ralt"))[0]
+    assert "меню окна" in warnings_for(parse("lalt"))[0]
+    assert warnings_for(parse("rctrl")) == []
+
+
+def test_altgr_chord_is_one_key():
+    """AltGr sends a synthetic left Ctrl together with the right Alt."""
+    assert collapse_altgr(["lctrl", "ralt"]) == ["ralt"]
+    assert collapse_altgr(["ralt", "lctrl"]) == ["ralt"]
+    assert collapse_altgr(["lctrl", "lalt"]) == ["lctrl", "lalt"]
+    assert collapse_altgr(["rctrl"]) == ["rctrl"]
 
 
 def test_altgr_is_the_right_alt():
@@ -258,4 +282,5 @@ def test_every_family_can_be_probed_on_both_sides():
     assert set(FAMILY_SIDE_VKS) == {"ctrl", "alt", "shift", "win"}
     for family, sides in FAMILY_SIDE_VKS.items():
         names = [name for name, _vk in sides]
-        assert all(parse(name).modifiers == (name,) for name in names)
+        # Combined with a key, because the Windows key alone is refused.
+        assert all(parse(f"{name}+f9").modifiers == (name,) for name in names)

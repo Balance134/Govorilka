@@ -22,6 +22,10 @@ def config_file() -> Path:
     return app_data_dir() / "config.json"
 
 
+def history_file() -> Path:
+    return app_data_dir() / "history.json"
+
+
 def logs_dir() -> Path:
     return app_data_dir() / "logs"
 

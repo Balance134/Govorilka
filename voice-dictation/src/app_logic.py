@@ -33,10 +33,11 @@ TIMEOUT_NOTICE = (
 )
 TOO_SHORT_NOTICE = "Слишком короткая запись"
 TOO_SHORT_AFTER_WARNING = "Запись слишком короткая, распознавание не запущено"
-LATE_RESULT_NOTICE = (
-    "Распознавание завершилось слишком поздно, текст не вставлен. "
-    "Продиктуйте ещё раз"
-)
+LATE_RESULT_BASE = "Распознавание завершилось слишком поздно, текст не вставлен"
+# Only when the history could not be written: without it the text is gone and
+# dictating again is the only thing left to do.
+LATE_RESULT_RETRY = f"{LATE_RESULT_BASE}. Продиктуйте ещё раз"
+NOT_INSERTED_BASE = "Текст не вставлен"
 
 BUSY_MESSAGES: dict[AppState, str] = {
     AppState.RECORDING: "Уже идёт запись — отпустите клавишу, чтобы закончить",
@@ -101,6 +102,35 @@ def decide_text_ready(
     return TextOutcome.INJECT
 
 
+def capture_target_window(
+    get_foreground: Callable[[], int],
+    belongs_to_this_process: Callable[[int], bool],
+) -> int:
+    """Handle of the window the transcript will be typed into, or 0.
+
+    Read while the user is still in their own window, before anything of ours
+    is shown. A handle of this process - the recording overlay, the settings
+    window - is refused: typing there would swallow the dictation and report
+    it as inserted. 0 means "unknown", which sends the text to the clipboard.
+    """
+    hwnd = get_foreground()
+    if not hwnd:
+        return 0
+    if belongs_to_this_process(hwnd):
+        log.warning("Foreground window belongs to this app, not typing into it")
+        return 0
+    return hwnd
+
+
+def timings_belong_to(outcome: TextOutcome) -> bool:
+    """Whether a delivered transcript may write into the current stopwatch.
+
+    A take the app stopped waiting for still arrives, and its numbers would
+    otherwise overwrite those of the dictation running right now.
+    """
+    return outcome in (TextOutcome.INJECT, TextOutcome.EMPTY)
+
+
 class TakeGuard:
     """Generation counter telling a live take from an abandoned one.
 
@@ -155,6 +185,11 @@ BAR_SHAPE = (0.62, 0.86, 1.0, 0.96, 0.78, 0.55)
 # ever scales the part above the floor, so silence stays perfectly still.
 BAR_RIPPLE = (1.0, 0.92, 0.8, 0.72, 0.8, 0.92)
 
+# The paint loop indexes both tables by bar, so a changed BAR_COUNT must fail
+# here at import instead of inside a 30 FPS repaint.
+assert len(BAR_SHAPE) == BAR_COUNT, "BAR_SHAPE needs one entry per bar"
+assert len(BAR_RIPPLE) == BAR_COUNT, "BAR_RIPPLE needs one entry per bar"
+
 IDLE_BARS: tuple[float, ...] = (BAR_FLOOR,) * BAR_COUNT
 
 
@@ -179,7 +214,7 @@ def next_bar_heights(
     level = min(max(level, 0.0), 1.0)
     bars = []
     for index in range(BAR_COUNT):
-        ripple = BAR_RIPPLE[(frame + index * 2) % len(BAR_RIPPLE)]
+        ripple = BAR_RIPPLE[(frame + index) % len(BAR_RIPPLE)]
         target = BAR_FLOOR + (1.0 - BAR_FLOOR) * level * BAR_SHAPE[index] * ripple
         was = previous[index] if index < len(previous) else BAR_FLOOR
         height = target if target >= was else max(target, was - BAR_DECAY_PER_FRAME)
@@ -241,3 +276,35 @@ class DictationTimings:
             self._inject_seconds,
             self._chars,
         )
+
+
+# ------------------------------------------------------------------ history
+HISTORY_HINT = "Текст сохранён в истории"
+CLIPBOARD_ONLY_NOTICE = (
+    "Не удалось определить поле ввода. Текст скопирован в буфер обмена"
+)
+
+
+def with_history_hint(message: str, saved: bool) -> str:
+    """Adds "the text is in the history" to a message about a paste that went
+    wrong - but only when the entry really reached the disk, so the app never
+    points the user at a history that stayed empty.
+    """
+    if not saved:
+        return message
+    text = message.strip().rstrip(".")
+    if not text:
+        return HISTORY_HINT
+    return f"{text}. {HISTORY_HINT}"
+
+
+LATE_RESULT_NOTICE = f"{LATE_RESULT_BASE}. {HISTORY_HINT}"
+
+
+def late_result_notice(saved: bool) -> str:
+    """A transcript the app decided not to inject is not a lost dictation any
+    more: it is on disk, so the user is pointed at the history instead of
+    being told to say the whole thing again."""
+    if not saved:
+        return LATE_RESULT_RETRY
+    return with_history_hint(LATE_RESULT_BASE, True)
