@@ -87,6 +87,10 @@ class HotkeyListener:
     ``on_press`` fires once per physical press (auto-repeat is suppressed) and
     ``on_release`` fires when the key or any required modifier goes up. Both
     run on the hook thread - marshal to the GUI thread on the receiving side.
+
+    A modifier-only hotkey (right Ctrl held on its own) is driven by the
+    modifier itself and is passed through to the focused application, so the
+    key keeps doing its usual job in Ctrl+C.
     """
 
     def __init__(
@@ -275,7 +279,20 @@ class HotkeyListener:
 
             if vk in ALL_MODIFIER_VKS:
                 if is_down:
+                    repeat = vk in self._pressed_modifier_vks
                     self._pressed_modifier_vks.add(vk)
+                    if (
+                        hotkey.is_modifier_only
+                        and vk == hotkey.trigger_vk
+                        and not repeat
+                        and not self._held
+                        and self._modifiers_satisfied(hotkey)
+                    ):
+                        self._held = True
+                        # Never swallowed: the key must keep working as a
+                        # normal modifier, or every shortcut on that side of
+                        # the keyboard dies.
+                        return False, self._on_press
                     return False, None
                 self._pressed_modifier_vks.discard(vk)
                 # Releasing a required modifier ends the hold; a foreign one

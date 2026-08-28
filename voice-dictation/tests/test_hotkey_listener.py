@@ -19,6 +19,7 @@ from src.hotkey.parser import (
     VK_LCONTROL,
     VK_LMENU,
     VK_LSHIFT,
+    VK_RCONTROL,
     VK_RSHIFT,
     parse,
 )
@@ -298,3 +299,82 @@ def test_a_failed_installation_can_be_retried(monkeypatch):
     with pytest.raises(RuntimeError):
         listener.start()
     assert runs == [1, 1]
+
+
+# ------------------------------------- a single side-specific modifier hotkey
+def test_a_held_modifier_fires_press_and_release_once():
+    listener, events = make_listener("rctrl")
+    assert down(listener, VK_RCONTROL) is False
+    assert events.events == ["press"]
+    assert up(listener, VK_RCONTROL) is False
+    assert events.events == ["press", "release"]
+
+
+def test_auto_repeat_of_a_modifier_does_not_fire_again():
+    listener, events = make_listener("rctrl")
+    down(listener, VK_RCONTROL)
+    down(listener, VK_RCONTROL)
+    down(listener, VK_RCONTROL)
+    assert events.events == ["press"]
+    up(listener, VK_RCONTROL)
+    assert events.events == ["press", "release"]
+
+
+def test_a_modifier_hotkey_is_never_swallowed():
+    """Right Ctrl must keep working as Ctrl in Ctrl+C."""
+    listener, _ = make_listener("rctrl")
+    assert down(listener, VK_RCONTROL) is False
+    assert down(listener, VK_A) is False  # rctrl+A reaches the application
+    assert up(listener, VK_A) is False
+    assert up(listener, VK_RCONTROL) is False
+    # A combination with a regular key is still swallowed.
+    combo, _ = make_listener()
+    down(combo, VK_LCONTROL)
+    down(combo, VK_LMENU)
+    assert down(combo, VK_SPACE) is True
+
+
+def test_the_other_side_of_the_family_does_not_fire():
+    listener, events = make_listener("rctrl")
+    assert down(listener, VK_LCONTROL) is False
+    assert events.events == []
+
+
+def test_an_extra_modifier_family_blocks_the_modifier_hotkey():
+    listener, events = make_listener("rctrl")
+    down(listener, VK_LSHIFT)
+    assert down(listener, VK_RCONTROL) is False
+    assert events.events == []
+    up(listener, VK_RCONTROL)
+    assert events.events == []
+
+
+def test_the_modifier_hotkey_works_after_the_extra_modifier_is_released():
+    listener, events = make_listener("rctrl")
+    down(listener, VK_LSHIFT)
+    down(listener, VK_RCONTROL)
+    up(listener, VK_RCONTROL)
+    up(listener, VK_LSHIFT)
+    down(listener, VK_RCONTROL)
+    assert events.events == ["press"]
+
+
+def test_a_regular_key_pressed_under_the_modifier_keeps_the_hold():
+    listener, events = make_listener("rctrl")
+    down(listener, VK_RCONTROL)
+    down(listener, VK_A)
+    up(listener, VK_A)
+    assert events.events == ["press"]
+    up(listener, VK_RCONTROL)
+    assert events.events == ["press", "release"]
+
+
+def test_switching_to_a_modifier_hotkey_does_not_arm_on_auto_repeat():
+    listener, events = make_listener()
+    down(listener, VK_RCONTROL)  # already physically held
+    listener.set_hotkey(parse("rctrl"))
+    down(listener, VK_RCONTROL)  # auto-repeat of that same press
+    assert events.events == []
+    up(listener, VK_RCONTROL)
+    assert down(listener, VK_RCONTROL) is False
+    assert events.events == ["press"]

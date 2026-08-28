@@ -23,6 +23,12 @@ BLOCK_SIZE = 1024
 MAX_DURATION_SEC = 300.0
 MAX_CHUNKS = int(MAX_DURATION_SEC * SAMPLE_RATE / BLOCK_SIZE) + 1
 
+MAX_SAMPLE = 32767
+# The level meter looks at every fourth sample only. Windows drops a slow audio
+# callback, and a quarter of the block is still one reading per 0.25 ms - far
+# more than a 30 FPS indicator can show.
+LEVEL_STRIDE = 4
+
 CAP_WARNING = "Достигнут предел длины записи — 5 минут"
 DEVICE_LOST_WARNING = "Микрофон пропал во время записи, распознана только часть"
 
@@ -48,6 +54,7 @@ class Recorder:
         self._failed = False
         self._capped = False
         self._stopping = False
+        self._peak = 0
 
     @property
     def is_recording(self) -> bool:
@@ -66,6 +73,7 @@ class Recorder:
             self._failed = False
             self._capped = False
             self._stopping = False
+            self._peak = 0
         try:
             # RawInputStream hands over plain bytes, so numpy is not needed.
             stream = sd.RawInputStream(
@@ -89,11 +97,24 @@ class Recorder:
             # survivable hiccups, so they are logged and nothing more. A device
             # that disappears shows up as an exception in stop().
             log.debug("Audio callback status: %s", status)
+        chunk = bytes(indata)
+        peak = block_peak(chunk)
         with self._lock:
+            # The meter keeps running past the cap: the microphone is still
+            # open, so the indicator must not freeze.
+            self._peak = peak
             if len(self._chunks) >= MAX_CHUNKS:
                 self._capped = True
                 return
-            self._chunks.append(bytes(indata))
+            self._chunks.append(chunk)
+
+    def peak_level(self) -> int:
+        """Loudest sample of the most recent block, 0..MAX_SAMPLE.
+
+        Cheap and thread-safe: the GUI polls it about 30 times a second.
+        """
+        with self._lock:
+            return self._peak
 
     def _on_stream_finished(self) -> None:
         """PortAudio ends the stream on its own when the device disappears."""
@@ -129,6 +150,7 @@ class Recorder:
             self._failed = False
             self._capped = False
             self._stopping = False
+            self._peak = 0
         if device_lost and not pcm:
             raise MicrophoneError("Микрофон недоступен")
         warning = None
@@ -159,6 +181,26 @@ class Recorder:
             self._failed = False
             self._capped = False
             self._stopping = False
+            self._peak = 0
+
+
+def block_peak(pcm: bytes) -> int:
+    """Peak amplitude of one 16-bit mono block, 0..MAX_SAMPLE.
+
+    Two C-level passes over a strided view: about 16 us for a 1024-frame block
+    against the 64 ms that block covers.
+    """
+    try:
+        samples = memoryview(pcm).cast("h")[::LEVEL_STRIDE]
+    except (TypeError, ValueError):
+        log.debug("Could not read the audio block as int16", exc_info=True)
+        return 0
+    if not len(samples):
+        return 0
+    high = max(samples)
+    low = min(samples)
+    peak = high if high >= -low else -low
+    return min(peak, MAX_SAMPLE)
 
 
 def encode_wav(pcm: bytes) -> bytes:

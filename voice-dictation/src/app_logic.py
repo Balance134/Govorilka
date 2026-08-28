@@ -8,10 +8,12 @@ tested on any OS.
 from __future__ import annotations
 
 import logging
+import math
+import time
 from enum import Enum
-from typing import Iterable, NamedTuple, Optional
+from typing import Callable, Iterable, NamedTuple, Optional, Sequence
 
-from .audio.recorder import CAP_WARNING, MAX_DURATION_SEC
+from .audio.recorder import CAP_WARNING, MAX_DURATION_SEC, MAX_SAMPLE
 from .config.model import ReplacementRule
 from .config.vocabulary import apply_replacements
 from .utils.state import AppState
@@ -132,3 +134,110 @@ def safe_apply_replacements(text: str, rules: Iterable[ReplacementRule]) -> str:
     except Exception:
         log.exception("Replacement table failed, using the raw transcript")
         return text
+
+
+# ------------------------------------------------------- recording indicator
+# Bar heights are fractions of the tallest bar, so the widget owns the pixels
+# and this file owns the behaviour.
+BAR_COUNT = 6
+# A resting bar stays visible as a flat dash: the overlay is a status hint, and
+# an empty rectangle would look broken rather than quiet.
+BAR_FLOOR = 0.08
+# Speech sits far below full scale, so a linear meter barely moves. Everything
+# quieter than this counts as silence.
+LEVEL_FLOOR_DB = -55.0
+# One frame at ~30 FPS. A bar falls from full height to the floor in about a
+# third of a second, which reads as a graceful drop instead of flicker.
+BAR_DECAY_PER_FRAME = 0.09
+# The middle bars are the tall ones; a flat row would look like a progress bar.
+BAR_SHAPE = (0.62, 0.86, 1.0, 0.96, 0.78, 0.55)
+# Ripple running along the row so the bars do not move as one lump. It only
+# ever scales the part above the floor, so silence stays perfectly still.
+BAR_RIPPLE = (1.0, 0.92, 0.8, 0.72, 0.8, 0.92)
+
+IDLE_BARS: tuple[float, ...] = (BAR_FLOOR,) * BAR_COUNT
+
+
+def peak_to_level(peak: int) -> float:
+    """Loudest sample of a block (0..MAX_SAMPLE) to a 0..1 loudness."""
+    if peak <= 0:
+        return 0.0
+    decibels = 20.0 * math.log10(min(peak, MAX_SAMPLE) / float(MAX_SAMPLE))
+    if decibels <= LEVEL_FLOOR_DB:
+        return 0.0
+    return min(1.0, (decibels - LEVEL_FLOOR_DB) / -LEVEL_FLOOR_DB)
+
+
+def next_bar_heights(
+    previous: Sequence[float], level: float, frame: int = 0
+) -> tuple[float, ...]:
+    """One frame of the equalizer: rises instantly, falls by a fixed step.
+
+    Pure on purpose - this is the only part of the indicator that can be wrong
+    in a way the user would notice.
+    """
+    level = min(max(level, 0.0), 1.0)
+    bars = []
+    for index in range(BAR_COUNT):
+        ripple = BAR_RIPPLE[(frame + index * 2) % len(BAR_RIPPLE)]
+        target = BAR_FLOOR + (1.0 - BAR_FLOOR) * level * BAR_SHAPE[index] * ripple
+        was = previous[index] if index < len(previous) else BAR_FLOOR
+        height = target if target >= was else max(target, was - BAR_DECAY_PER_FRAME)
+        bars.append(min(max(height, BAR_FLOOR), 1.0))
+    return tuple(bars)
+
+
+# ------------------------------------------------------------------ timings
+def format_timings(
+    audio_seconds: float,
+    transcribe_seconds: Optional[float],
+    inject_seconds: Optional[float],
+    chars: int,
+) -> str:
+    """One line per dictation, so the wait can be measured instead of guessed.
+
+    Never carries the transcript itself - only how many characters it had.
+    """
+    return "dictation timings: audio={} transcribe={} inject={} chars={}".format(
+        _seconds(audio_seconds),
+        _seconds(transcribe_seconds),
+        _seconds(inject_seconds),
+        max(chars, 0),
+    )
+
+
+def _seconds(value: Optional[float]) -> str:
+    if value is None:
+        return "?"  # the stage never happened, e.g. an injection that failed
+    return "{:.1f}s".format(max(value, 0.0))
+
+
+class DictationTimings:
+    """Stopwatch over one dictation, started when the hotkey is released."""
+
+    def __init__(
+        self, audio_seconds: float, clock: Callable[[], float] = time.monotonic
+    ) -> None:
+        self._clock = clock
+        self._audio_seconds = audio_seconds
+        self._released_at = clock()
+        self._transcribe_seconds: Optional[float] = None
+        self._inject_seconds: Optional[float] = None
+        self._chars = 0
+
+    def transcript_ready(self, chars: int) -> None:
+        self._transcribe_seconds = self._clock() - self._released_at
+        self._chars = chars
+
+    def injected(self) -> None:
+        self._inject_seconds = self._clock() - self._released_at - (
+            self._transcribe_seconds or 0.0
+        )
+
+    def as_line(self) -> str:
+        return format_timings(
+            self._audio_seconds,
+            self._transcribe_seconds,
+            self._inject_seconds,
+            self._chars,
+        )

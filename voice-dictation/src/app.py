@@ -18,6 +18,7 @@ from PySide6.QtCore import (
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .app_logic import (
+    DictationTimings,
     LATE_RESULT_NOTICE,
     MAX_RECORDING_MS,
     TakeGuard,
@@ -33,6 +34,7 @@ from .audio.recorder import (
     MicrophoneError,
     Recorder,
     is_too_short,
+    wav_duration_seconds,
 )
 from .config import store
 from .config.model import AppConfig
@@ -43,6 +45,7 @@ from .hotkey.listener import HotkeyListener
 from .hotkey.parser import HotkeyError, parse as parse_hotkey
 from .injection import focus, typer
 from .tray.tray_icon import TrayIcon, app_icon
+from .ui.level_indicator import LevelIndicator
 from .ui.settings_window import SettingsWindow
 from .utils import logging_setup, single_instance
 from .utils.state import AppState, StateMachine
@@ -204,7 +207,16 @@ class DictationApp(QObject):
         self._transcribe_worker: TranscribeWorker | None = None
         self._inject_worker: InjectWorker | None = None
         self._take = TakeGuard()
+        self._timings: DictationTimings | None = None
         self._shutting_down = False
+
+        # The indicator is a comfort, never a requirement: dictation has to
+        # work even if the overlay cannot be created at all.
+        self._indicator: LevelIndicator | None = None
+        try:
+            self._indicator = LevelIndicator(self._recorder.peak_level)
+        except Exception:
+            log.exception("Could not create the recording indicator")
 
         icon = app_icon()
         self._tray = TrayIcon(self)
@@ -374,6 +386,13 @@ class DictationApp(QObject):
             self._fail("Микрофон недоступен")
             return
 
+        try:
+            audio_seconds = wav_duration_seconds(recording.wav)
+        except Exception:
+            log.debug("Could not measure the take", exc_info=True)
+            audio_seconds = 0.0
+        self._timings = DictationTimings(audio_seconds)
+
         # Partial or capped audio still gets transcribed, but never silently.
         outcome = decide_stop(
             recording.warning, is_too_short(recording.wav), timed_out
@@ -422,6 +441,8 @@ class DictationApp(QObject):
     # ------------------------------------------------------------ injection
     def _on_text_ready(self, text: str, generation: int) -> None:
         corrected = safe_apply_replacements(text, self._config.replacements)
+        if self._timings is not None:
+            self._timings.transcript_ready(len(corrected))
         outcome = decide_text_ready(
             self._shutting_down, self._take.is_current(generation), corrected
         )
@@ -465,15 +486,25 @@ class DictationApp(QObject):
     def _on_injected(self) -> None:
         if self._shutting_down:
             return
+        self._log_timings()
         self._state.force_idle()
 
     def _on_clipboard_only(self) -> None:
         if self._shutting_down:
             return
+        self._log_timings()
         self._state.force_idle()
         self._tray.notify(
             "Не удалось определить поле ввода. Текст скопирован в буфер обмена"
         )
+
+    def _log_timings(self) -> None:
+        """One line per finished dictation: where the wait actually went."""
+        if self._timings is None:
+            return
+        self._timings.injected()
+        log.info("%s", self._timings.as_line())
+        self._timings = None
 
     # ----------------------------------------------------------- worker ends
     def _on_transcribe_finished(self) -> None:
@@ -512,6 +543,7 @@ class DictationApp(QObject):
 
     def _on_state_changed(self, state: AppState) -> None:
         self._tray.set_state(state)
+        self._show_indicator(state is AppState.RECORDING)
         self._recording_timer.stop()
         self._busy_timer.stop()
         if state is AppState.RECORDING:
@@ -520,6 +552,26 @@ class DictationApp(QObject):
             self._busy_timer.start()
         if state is not AppState.ERROR:
             self._error_timer.stop()
+
+    # ------------------------------------------------------------ indicator
+    def _show_indicator(self, visible: bool) -> None:
+        if self._indicator is None:
+            return
+        try:
+            if visible and not self._shutting_down:
+                self._indicator.start()
+            else:
+                self._indicator.stop()
+        except Exception:
+            log.exception("Recording indicator failed, carrying on without it")
+            self._indicator = None
+
+    def _close_indicator(self) -> None:
+        indicator = self._indicator
+        self._indicator = None
+        if indicator is not None:
+            indicator.stop()
+            indicator.deleteLater()
 
     # ------------------------------------------------------------- shutdown
     def quit(self) -> None:
@@ -541,6 +593,7 @@ class DictationApp(QObject):
             lambda: logging_setup.set_notifier(None),
             self._stop_listener,
             self._recorder.abort,
+            self._close_indicator,
             lambda: self._qt_app.removeNativeEventFilter(self._event_filter),
             self._disconnect_signals,
             self._settings.close,

@@ -19,6 +19,11 @@ if "sounddevice" not in sys.modules:  # pragma: no cover - depends on the box
 
 from src import app_logic
 from src.app_logic import (
+    BAR_COUNT,
+    BAR_DECAY_PER_FRAME,
+    BAR_FLOOR,
+    DictationTimings,
+    IDLE_BARS,
     LATE_RESULT_NOTICE,
     MAX_RECORDING_MS,
     StopOutcome,
@@ -27,6 +32,9 @@ from src.app_logic import (
     busy_message,
     decide_stop,
     decide_text_ready,
+    format_timings,
+    next_bar_heights,
+    peak_to_level,
     safe_apply_replacements,
 )
 from src.audio import recorder as recorder_module
@@ -35,10 +43,12 @@ from src.audio.recorder import (
     DEVICE_LOST_WARNING,
     MAX_CHUNKS,
     MAX_DURATION_SEC,
+    MAX_SAMPLE,
     BLOCK_SIZE,
     MicrophoneError,
     Recorder,
     SAMPLE_RATE,
+    block_peak,
     wav_duration_seconds,
 )
 
@@ -324,3 +334,140 @@ def test_a_failing_replacement_table_falls_back_to_the_raw_transcript(monkeypatc
 def test_replacements_are_applied_when_the_table_works(monkeypatch):
     monkeypatch.setattr(app_logic, "apply_replacements", lambda text, rules: text.upper())
     assert safe_apply_replacements("привет", []) == "ПРИВЕТ"
+
+
+# ---------------------------------------------- recording indicator: metering
+def loud_block(value: int = 20_000) -> bytes:
+    return value.to_bytes(2, "little", signed=True) * BLOCK_SIZE
+
+
+def test_a_silent_block_reads_as_zero():
+    assert block_peak(b"\x00\x00" * BLOCK_SIZE) == 0
+
+
+def test_the_peak_ignores_the_sign_of_the_sample():
+    quiet_but_negative = (-9000).to_bytes(2, "little", signed=True) * BLOCK_SIZE
+    assert block_peak(quiet_but_negative) == 9000
+
+
+def test_the_peak_never_leaves_the_16_bit_range():
+    assert block_peak((-32768).to_bytes(2, "little", signed=True) * 8) == MAX_SAMPLE
+
+
+def test_an_odd_sized_block_does_not_kill_the_callback():
+    assert block_peak(b"\x01\x02\x03") == 0
+
+
+def test_the_recorder_publishes_the_level_of_the_last_block(rec):
+    rec.start()
+    assert rec.peak_level() == 0
+    rec._callback(loud_block(), BLOCK_SIZE, None, FakeCallbackFlags())
+    assert rec.peak_level() == 20_000
+    rec._callback(b"\x00\x00" * BLOCK_SIZE, BLOCK_SIZE, None, FakeCallbackFlags())
+    assert rec.peak_level() == 0  # silence must show as silence, not as decay
+
+
+def test_the_level_keeps_moving_after_the_cap(rec):
+    """The microphone is still open at the cap, so the indicator must not freeze."""
+    rec.start()
+    feed(rec, MAX_CHUNKS)
+    rec._callback(loud_block(), BLOCK_SIZE, None, FakeCallbackFlags())
+    assert rec.peak_level() == 20_000
+
+
+def test_a_finished_take_leaves_the_level_at_rest(rec):
+    rec.start()
+    rec._callback(loud_block(), BLOCK_SIZE, None, FakeCallbackFlags())
+    rec.stop()
+    assert rec.peak_level() == 0
+
+
+# ------------------------------------------------- recording indicator: bars
+def test_silence_is_the_floor_and_full_scale_is_the_top():
+    assert peak_to_level(0) == 0.0
+    assert peak_to_level(MAX_SAMPLE) == pytest.approx(1.0)
+
+
+def test_the_scale_is_logarithmic_not_linear():
+    """Half of full scale is -6 dB, which must land near the top, not at 0.5."""
+    assert peak_to_level(MAX_SAMPLE // 2) > 0.85
+
+
+def test_a_barely_audible_sample_counts_as_silence():
+    assert peak_to_level(5) == 0.0
+
+
+def test_silence_leaves_every_bar_on_the_floor():
+    bars = next_bar_heights(IDLE_BARS, 0.0, frame=3)
+    assert len(bars) == BAR_COUNT
+    assert bars == IDLE_BARS
+
+
+def test_a_loud_take_pushes_a_bar_to_the_top():
+    bars = IDLE_BARS
+    tallest = 0.0
+    for frame in range(len(app_logic.BAR_RIPPLE)):
+        bars = next_bar_heights(bars, 1.0, frame)
+        tallest = max(tallest, max(bars))
+    assert tallest == pytest.approx(1.0)
+    assert min(bars) > BAR_FLOOR  # every bar is alive while speech goes on
+
+
+def test_the_bars_are_not_all_the_same_height():
+    bars = next_bar_heights(IDLE_BARS, 0.8, frame=0)
+    assert len(set(round(bar, 3) for bar in bars)) > 1
+
+
+def test_a_bar_falls_by_one_step_per_frame_instead_of_dropping_out():
+    full = (1.0,) * BAR_COUNT
+    after = next_bar_heights(full, 0.0, frame=0)
+    assert all(bar == pytest.approx(1.0 - BAR_DECAY_PER_FRAME) for bar in after)
+    assert all(bar > BAR_FLOOR for bar in after)
+
+
+def test_the_decay_ends_on_the_floor_and_stays_there():
+    bars = (1.0,) * BAR_COUNT
+    for frame in range(50):
+        bars = next_bar_heights(bars, 0.0, frame)
+    assert bars == IDLE_BARS
+
+
+def test_a_bar_rises_at_once_when_the_voice_comes_back():
+    quiet = next_bar_heights(IDLE_BARS, 0.0, frame=0)
+    loud = next_bar_heights(quiet, 1.0, frame=0)
+    assert max(loud) > 0.5  # attack is immediate, only the fall is smoothed
+
+
+def test_out_of_range_levels_are_clamped():
+    assert next_bar_heights(IDLE_BARS, -5.0, frame=0) == IDLE_BARS
+    assert max(next_bar_heights(IDLE_BARS, 99.0, frame=2)) <= 1.0
+
+
+# ---------------------------------------------------------------- timings
+def test_the_timing_line_names_every_stage():
+    line = format_timings(4.12, 2.74, 0.21, chars=57)
+    assert line == "dictation timings: audio=4.1s transcribe=2.7s inject=0.2s chars=57"
+
+
+def test_an_unfinished_stage_is_a_question_mark_not_a_zero():
+    line = format_timings(4.0, None, None, chars=0)
+    assert "transcribe=? inject=?" in line
+
+
+def test_the_timings_measure_the_two_waits_separately():
+    ticks = iter([100.0, 103.5, 103.9])
+    timings = DictationTimings(4.0, clock=lambda: next(ticks))
+    timings.transcript_ready(chars=57)
+    timings.injected()
+    assert timings.as_line() == (
+        "dictation timings: audio=4.0s transcribe=3.5s inject=0.4s chars=57"
+    )
+
+
+def test_the_timing_line_never_carries_the_transcript():
+    ticks = iter([0.0, 1.0, 1.2])
+    timings = DictationTimings(2.0, clock=lambda: next(ticks))
+    timings.transcript_ready(chars=len("совершенно секретный текст"))
+    timings.injected()
+    assert "секретный" not in timings.as_line()
+    assert "chars=26" in timings.as_line()

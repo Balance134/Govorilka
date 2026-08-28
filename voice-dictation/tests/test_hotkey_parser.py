@@ -1,13 +1,17 @@
 import pytest
 
 from src.hotkey.parser import (
+    FAMILY_SIDE_VKS,
     LOCK_KEYS,
     SYSTEM_KEYS,
     VK_LCONTROL,
+    VK_RCONTROL,
     HotkeyError,
     from_parts,
     key_token_to_vk,
     parse,
+    resolve_modifier_side,
+    side_required_message,
     vk_to_key_token,
     warnings_for,
 )
@@ -138,3 +142,120 @@ def test_missing_key_error_mentions_the_plus_workaround():
 
 def test_equals_sign_stays_the_canonical_name_for_that_key():
     assert vk_to_key_token(0xBB) == "="
+
+
+# ------------------------------------- a single side-specific modifier hotkey
+@pytest.mark.parametrize(
+    "text", ["rctrl", "lctrl", "ralt", "lalt", "rshift", "lshift", "rwin", "lwin"]
+)
+def test_a_single_side_specific_modifier_is_a_hotkey(text):
+    hotkey = parse(text)
+    assert hotkey.is_modifier_only
+    assert hotkey.key == ""
+    assert hotkey.to_string() == text
+    assert parse(hotkey.to_string()) == hotkey
+
+
+def test_modifier_only_hotkey_triggers_on_its_own_vk():
+    assert parse("rctrl").trigger_vk == VK_RCONTROL
+    assert parse("ctrl+alt+space").trigger_vk == 0x20
+
+
+def test_altgr_is_the_right_alt():
+    assert parse("altgr").to_string() == "ralt"
+
+
+@pytest.mark.parametrize(
+    "text,sides",
+    [
+        ("ctrl", "rctrl или lctrl"),
+        ("alt", "ralt или lalt"),
+        ("shift", "rshift или lshift"),
+        ("win", "rwin или lwin"),
+    ],
+)
+def test_a_generic_modifier_alone_asks_for_a_side(text, sides):
+    with pytest.raises(HotkeyError, match=sides):
+        parse(text)
+
+
+def test_two_modifiers_without_a_key_are_still_rejected():
+    with pytest.raises(HotkeyError, match="обычной клавиши"):
+        parse("rctrl+ralt")
+
+
+def test_from_parts_builds_a_modifier_only_hotkey():
+    assert from_parts(["rctrl"]).to_string() == "rctrl"
+    with pytest.raises(HotkeyError, match="rctrl или lctrl"):
+        from_parts(["ctrl"])
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ctrl+alt+delete",
+        "ctrl+alt+shift+delete",
+        "ctrl+alt+win+del",
+        "win+l",
+        "win+shift+l",
+        "ctrl+win+alt+l",
+    ],
+)
+def test_windows_reserved_combinations_are_rejected_with_extra_modifiers(text):
+    with pytest.raises(HotkeyError, match="Windows"):
+        parse(text)
+
+
+def test_a_reserved_key_stays_usable_in_a_different_combination():
+    assert parse("ctrl+shift+delete").to_string() == "ctrl+shift+delete"
+    assert parse("ctrl+shift+l").to_string() == "ctrl+shift+l"
+
+
+# ------------------------------------ which side of the keyboard was pressed
+def test_key_state_alone_names_the_side():
+    # Windows reports the generic VK_CONTROL and no usable scan code.
+    assert resolve_modifier_side(0x11, 0, ["rctrl"]) == "rctrl"
+
+
+def test_key_state_outranks_a_disagreeing_event():
+    assert resolve_modifier_side(VK_LCONTROL, 0x1D, ["rctrl"]) == "rctrl"
+
+
+def test_native_virtual_key_is_used_when_windows_cannot_be_asked():
+    assert resolve_modifier_side(VK_RCONTROL, 0x1D, []) == "rctrl"
+
+
+def test_scancode_is_the_last_resort():
+    assert resolve_modifier_side(0x11, 0xE01D, []) == "rctrl"
+    assert resolve_modifier_side(0x11, 0x1D, []) == "lctrl"
+    assert resolve_modifier_side(0x12, 0x138, []) == "ralt"  # 0x100 extended flag
+    assert resolve_modifier_side(0x10, 0x36, []) == "rshift"
+    assert resolve_modifier_side(0x10, 0x2A, []) == "lshift"
+
+
+def test_both_sides_held_falls_back_to_the_event():
+    assert resolve_modifier_side(0x11, 0xE01D, ["lctrl", "rctrl"]) == "rctrl"
+    assert resolve_modifier_side(VK_LCONTROL, 0, ["lctrl", "rctrl"]) == "lctrl"
+
+
+def test_both_sides_held_and_nothing_else_known_is_ambiguous():
+    assert resolve_modifier_side(0x11, 0, ["lctrl", "rctrl"]) is None
+
+
+def test_everything_ambiguous_gives_no_side():
+    assert resolve_modifier_side(0x11, 0, []) is None
+    assert resolve_modifier_side(0, 0, []) is None
+
+
+def test_an_ambiguous_side_is_refused_out_loud():
+    message = side_required_message("ctrl")
+    assert "rctrl" in message and "lctrl" in message
+    with pytest.raises(HotkeyError, match="rctrl или lctrl"):
+        parse("ctrl")
+
+
+def test_every_family_can_be_probed_on_both_sides():
+    assert set(FAMILY_SIDE_VKS) == {"ctrl", "alt", "shift", "win"}
+    for family, sides in FAMILY_SIDE_VKS.items():
+        names = [name for name, _vk in sides]
+        assert all(parse(name).modifiers == (name,) for name in names)

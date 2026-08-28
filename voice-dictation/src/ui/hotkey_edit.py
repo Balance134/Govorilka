@@ -2,11 +2,28 @@
 
 from __future__ import annotations
 
+import ctypes
+import logging
+import sys
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QLineEdit
 
-from ..hotkey.parser import Hotkey, HotkeyError, from_parts, key_token_to_vk, parse
+from ..hotkey.parser import (
+    FAMILY_SIDE_VKS,
+    Hotkey,
+    HotkeyError,
+    from_parts,
+    key_token_to_vk,
+    parse,
+    resolve_modifier_side,
+    side_required_message,
+)
+
+log = logging.getLogger(__name__)
+
+KEY_DOWN_BIT = 0x8000
 
 _MODIFIER_KEYS = {
     Qt.Key_Control,
@@ -39,6 +56,53 @@ _QT_KEY_TOKENS = {
 for _i in range(1, 25):
     _QT_KEY_TOKENS[getattr(Qt, f"Key_F{_i}")] = f"f{_i}"
 
+# Modifier family of a Qt key, so we know which pair of virtual keys to ask
+# Windows about. Caps Lock is deliberately absent - it is no hotkey.
+_QT_KEY_FAMILIES = {
+    Qt.Key_Control: "ctrl",
+    Qt.Key_Alt: "alt",
+    Qt.Key_AltGr: "alt",
+    Qt.Key_Shift: "shift",
+    Qt.Key_Meta: "win",
+}
+
+
+def _load_user32():
+    """user32 for the key-state check; None everywhere it is unavailable."""
+    if sys.platform != "win32":
+        return None
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetKeyState.argtypes = [ctypes.c_int]
+        user32.GetKeyState.restype = ctypes.c_short
+        return user32
+    except Exception:  # pragma: no cover - Windows only
+        log.exception("Cannot load user32, key side will be guessed from the event")
+        return None
+
+
+_user32 = _load_user32()
+
+
+def _held_sides(family: str) -> tuple[str, ...]:
+    """Which sides of a family Windows sees as held down right now.
+
+    GetKeyState (not GetAsyncKeyState) on purpose: it answers for the message
+    being processed, which is exactly the key event in hand, so a key already
+    released by the time Qt delivers the event cannot mislead us.
+    """
+    if _user32 is None:
+        return ()
+    try:  # pragma: no cover - Windows only
+        return tuple(
+            name
+            for name, vk in FAMILY_SIDE_VKS[family]
+            if _user32.GetKeyState(vk) & KEY_DOWN_BIT
+        )
+    except Exception:  # pragma: no cover - Windows only
+        log.exception("GetKeyState failed")
+        return ()
+
 
 class HotkeyEdit(QLineEdit):
     """Shows a combination string; typing into it is impossible by design."""
@@ -50,6 +114,13 @@ class HotkeyEdit(QLineEdit):
         self.setReadOnly(True)
         self.setPlaceholderText("Нажмите нужное сочетание")
         self._hotkey: Hotkey | None = None
+        # State of the combination being held right now, reset once every
+        # modifier is up again.
+        self._modifiers_down: set[int] = set()
+        self._chord_modifiers: list[str] = []
+        self._chord_unnamed_families: list[str] = []
+        self._chord_has_unknown_modifier = False
+        self._chord_has_regular_key = False
         self.set_hotkey_text(hotkey_text)
 
     def set_hotkey_text(self, text: str) -> None:
@@ -66,10 +137,12 @@ class HotkeyEdit(QLineEdit):
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 - Qt naming
         key = event.key()
         if key in _MODIFIER_KEYS:
+            self._remember_modifier(event)
             self.setText(self._modifier_preview(event) + "…")
             event.accept()
             return
 
+        self._chord_has_regular_key = True
         modifiers = self._modifier_names(event)
         vk = int(event.nativeVirtualKey() or 0)
         if not vk:
@@ -94,10 +167,79 @@ class HotkeyEdit(QLineEdit):
         event.accept()
 
     def keyReleaseEvent(self, event: QKeyEvent) -> None:  # noqa: N802 - Qt naming
+        if event.key() not in _MODIFIER_KEYS:
+            event.accept()
+            return
+
+        self._modifiers_down.discard(self._modifier_identity(event))
+        if self._modifiers_down:
+            event.accept()  # other modifiers are still held, wait for them
+            return
+
+        committed = self._finish_chord()
         # A dangling "ctrl+alt+…" preview would look broken; restore the value.
-        if event.key() in _MODIFIER_KEYS and self.text().endswith("…"):
+        if not committed and self.text().endswith("…"):
             self.setText(self._hotkey.to_string() if self._hotkey else "")
+        self._chord_modifiers = []
+        self._chord_unnamed_families = []
+        self._chord_has_unknown_modifier = False
+        self._chord_has_regular_key = False
         event.accept()
+
+    def _finish_chord(self) -> bool:
+        """Modifiers only, and exactly one of them - that is the hotkey."""
+        if self._chord_has_regular_key or self._chord_has_unknown_modifier:
+            return False
+        if not self._chord_unnamed_families and len(self._chord_modifiers) == 1:
+            return self._commit_modifier_only(self._chord_modifiers[0])
+        if not self._chord_modifiers and len(set(self._chord_unnamed_families)) == 1:
+            # The user held one modifier and nothing could tell us the side.
+            # Saying so beats committing the wrong key silently.
+            self.captureFailed.emit(
+                side_required_message(self._chord_unnamed_families[0])
+            )
+        return False
+
+    def _commit_modifier_only(self, name: str) -> bool:
+        try:
+            hotkey = from_parts([name])
+        except HotkeyError as exc:
+            self.captureFailed.emit(str(exc))
+            return False
+        self._hotkey = hotkey
+        self.setText(hotkey.to_string())
+        return True
+
+    def _remember_modifier(self, event: QKeyEvent) -> None:
+        self._modifiers_down.add(self._modifier_identity(event))
+        family = _QT_KEY_FAMILIES.get(event.key())
+        if family is None:
+            self._chord_has_unknown_modifier = True  # Caps Lock is no hotkey
+            return
+        token = self._modifier_side(event)
+        if token is None:
+            self._chord_unnamed_families.append(family)
+        elif token not in self._chord_modifiers:
+            self._chord_modifiers.append(token)
+
+    @staticmethod
+    def _modifier_identity(event: QKeyEvent) -> int:
+        """Tells the two keys of a family apart while both are held."""
+        return (
+            int(event.nativeScanCode() or 0)
+            or int(event.nativeVirtualKey() or 0)
+            or int(event.key())
+        )
+
+    @staticmethod
+    def _modifier_side(event: QKeyEvent) -> str | None:
+        """Side-specific name of the modifier just pressed, or None."""
+        family = _QT_KEY_FAMILIES[event.key()]
+        return resolve_modifier_side(
+            int(event.nativeVirtualKey() or 0),
+            int(event.nativeScanCode() or 0),
+            _held_sides(family),
+        )
 
     @staticmethod
     def _modifier_names(event: QKeyEvent) -> list[str]:
