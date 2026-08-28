@@ -55,8 +55,10 @@ class Recorder:
 
     def start(self) -> None:
         if self._stream is not None:
-            # Never reuse a half-full buffer: the caller thinks it starts a
-            # fresh take and would get the previous one appended to it.
+            # Defence in depth: the app no longer gets here, because a second
+            # hotkey press during RECORDING is already refused upstream. Never
+            # reuse a half-full buffer either way - the caller thinks it starts
+            # a fresh take and would get the previous one appended to it.
             log.error("Recorder.start() called while a stream is already open")
             raise MicrophoneError("Запись уже идёт")
         with self._lock:

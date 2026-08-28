@@ -55,6 +55,11 @@ excludes = [
     "unittest",
     "pytest",
     "matplotlib",
+    # Safe to exclude: the recorder reads raw bytes through sd.RawInputStream
+    # and never touches sd.InputStream/sd.rec, the only sounddevice entry
+    # points that need numpy. On a machine that happens to have numpy
+    # installed, keeping it would add ~40 MB to the one-file .exe.
+    "numpy",
 ]
 
 a = Analysis(

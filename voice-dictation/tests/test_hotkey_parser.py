@@ -1,6 +1,8 @@
 import pytest
 
 from src.hotkey.parser import (
+    LOCK_KEYS,
+    SYSTEM_KEYS,
     VK_LCONTROL,
     HotkeyError,
     from_parts,
@@ -101,8 +103,17 @@ def test_lock_keys_are_rejected_as_the_main_key(text):
 
 
 def test_printscreen_is_rejected_as_the_main_key():
-    with pytest.raises(HotkeyError, match="Windows"):
+    with pytest.raises(HotkeyError, match="обрабатывает сама Windows"):
         parse("ctrl+printscreen")
+
+
+def test_each_unusable_key_gets_its_own_reason():
+    """The lock branch used to swallow the system branch entirely."""
+    with pytest.raises(HotkeyError, match="режим клавиатуры"):
+        parse("ctrl+capslock")
+    with pytest.raises(HotkeyError, match="обрабатывает сама Windows"):
+        parse("ctrl+printscreen")
+    assert LOCK_KEYS.isdisjoint(SYSTEM_KEYS)
 
 
 def test_lock_keys_are_rejected_from_the_capture_widget_too():

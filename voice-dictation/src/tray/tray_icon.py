@@ -80,6 +80,8 @@ class TrayIcon(QObject):
         self._tray.showMessage(title, message, self._icons[AppState.IDLE], 4000)
 
     def _on_activated(self, reason) -> None:
-        self.iconActivated.emit()
+        # A right-click already opens the context menu and a middle click means
+        # nothing here, so only a real activation reaches the coordinator - it
+        # decides between retrying the hook and opening the settings.
         if reason in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger):
-            self.settingsRequested.emit()
+            self.iconActivated.emit()

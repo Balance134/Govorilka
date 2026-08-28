@@ -6,6 +6,9 @@ Nothing here touches Win32: the listener is built but never started, and only
 
 import threading
 
+import pytest
+
+from src.hotkey import listener as listener_module
 from src.hotkey.listener import (
     LLKHF_INJECTED,
     WM_KEYDOWN,
@@ -221,3 +224,77 @@ def test_callback_exception_does_not_break_the_hook():
     down(listener, VK_LMENU)
     assert down(listener, VK_SPACE) is True
     assert up(listener, VK_SPACE) is True
+
+
+# ------------------------------------------------- #1 one hook and one only
+def arm_for_windows(monkeypatch, listener, run) -> None:
+    """Lets start() run its Windows path with a fake hook thread."""
+    monkeypatch.setattr(listener_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(listener_module, "HOOK_READY_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(listener, "_run", run)
+
+
+def test_install_timeout_keeps_the_thread_and_refuses_a_second_start(monkeypatch):
+    runs = []
+    release = threading.Event()
+    listener, _ = make_listener()
+
+    def slow_run():
+        runs.append(1)  # never reports back in time
+        release.wait(5)
+
+    arm_for_windows(monkeypatch, listener, slow_run)
+    try:
+        with pytest.raises(RuntimeError, match="не запустился"):
+            listener.start()
+        # The thread is still alive and may install the hook a moment later:
+        # it is told to unhook itself and kept, so nothing installs a second.
+        assert listener._thread is not None
+        assert listener._cancelled.is_set()
+        assert listener.is_running is False
+
+        with pytest.raises(RuntimeError, match="Перезапустите программу"):
+            listener.start()
+        assert runs == [1]  # no second hook thread was started
+    finally:
+        release.set()
+
+
+def test_a_started_listener_does_not_start_twice(monkeypatch):
+    runs = []
+    release = threading.Event()
+    listener, _ = make_listener()
+
+    def run():
+        runs.append(1)
+        listener._ready.set()
+        release.wait(5)
+
+    arm_for_windows(monkeypatch, listener, run)
+    try:
+        listener.start()
+        assert listener.is_running is True
+        listener.start()  # idempotent, not a second hook
+        assert runs == [1]
+    finally:
+        release.set()
+
+
+def test_a_failed_installation_can_be_retried(monkeypatch):
+    runs = []
+    listener, _ = make_listener()
+
+    def run():
+        runs.append(1)
+        listener._install_error = "Не удалось перехватить клавиатуру"
+        listener._ready.set()
+
+    arm_for_windows(monkeypatch, listener, run)
+    with pytest.raises(RuntimeError, match="перехватить клавиатуру"):
+        listener.start()
+    # The thread is gone and no hook was installed, so a retry is safe.
+    assert listener._thread is None
+    assert listener.is_running is False
+    with pytest.raises(RuntimeError):
+        listener.start()
+    assert runs == [1, 1]

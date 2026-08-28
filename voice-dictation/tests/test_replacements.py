@@ -145,3 +145,26 @@ def test_replacement_hard_limit():
     with pytest.raises(ValidationError, match="больше 500"):
         validate_replacements(rules)
     assert validate_replacements(rules[:500]) == rules[:500]
+
+
+def test_expanding_case_fold_does_not_lose_the_dictation():
+    # "İstanbul".casefold() is "i" + U+0307, but the alternation matches plain
+    # "istanbul" under IGNORECASE: the lookup misses and used to raise.
+    rules = [ReplacementRule("Стамбул", ["İstanbul"])]
+    assert apply_replacements("istanbul kebab", rules) == "istanbul kebab"
+
+
+def test_expanding_case_fold_still_replaces_the_exact_spelling():
+    rules = [ReplacementRule("Стамбул", ["İstanbul"])]
+    assert apply_replacements("İstanbul — город", rules) == "Стамбул — город"
+
+
+def test_no_rule_can_make_a_replacement_raise():
+    # Anything the model returns must come back out, replaced or not.
+    rules = [
+        ReplacementRule("Стамбул", ["İstanbul"]),
+        ReplacementRule("улица", ["ΟΔΟΣ"]),
+        ReplacementRule("улочка", ["Straße"]),
+    ]
+    for text in ("istanbul", "οδος", "ΟΔΌΣ", "strasse", "STRASSE", "ﬁle"):
+        assert apply_replacements(text, rules)

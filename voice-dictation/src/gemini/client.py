@@ -57,10 +57,15 @@ UPLOAD_READ_TIMEOUT = 180
 FILE_TIMEOUT = 30
 
 # Above this base64 size the payload goes through the Files API instead of
-# being inlined. Dictation never reaches it; long recordings can.
-# Do not raise it: https://ai.google.dev/gemini-api/docs/audio caps the whole
-# request at 20 MB, so 15 MB of base64 keeps headers and config inside it.
-INLINE_LIMIT_BYTES = 15 * 1024 * 1024
+# being inlined. The number is tied to the recorder's own cap: a take is at
+# most MAX_DURATION_SEC (300 s) of 16 kHz 16-bit mono, i.e. ~9.6 MB of WAV and
+# ~12.8 MB of base64 (src/audio/recorder.py). Anything at or above that would
+# make the upload path unreachable dead code, so the limit stays well below it
+# and a dictation longer than about three minutes really goes through the Files
+# API - which also means it gets deleted from Google afterwards.
+# Do not raise it above 15 MB either: https://ai.google.dev/gemini-api/docs/audio
+# caps the whole request at 20 MB. test_gemini_response.py pins both bounds.
+INLINE_LIMIT_BYTES = 8 * 1024 * 1024
 
 # Retries: transient statuses only, never 400/401/403. The budget below caps
 # the total time spent sleeping so the app cannot look hung.
@@ -247,7 +252,11 @@ class GeminiClient:
         file_name: str | None = None
         try:
             if len(audio_b64) > INLINE_LIMIT_BYTES:
-                file_uri, file_name = self._upload_file(audio_wav)
+                file_uri, file_name, file_info = self._upload_file(audio_wav)
+                # Activation is awaited here and not inside _upload_file: the
+                # name is already assigned, so a file that gets stuck in
+                # PROCESSING or comes back FAILED is still deleted below.
+                self._await_active(file_info, file_name)
                 body = build_request_body(
                     None, vocabulary, language_codes, file_uri=file_uri
                 )
@@ -301,7 +310,14 @@ class GeminiClient:
         return text
 
     def _request(self, method: str, url: str, **kwargs: Any) -> "requests.Response":
-        """One HTTP call plus bounded retries on transient failures."""
+        """One HTTP call plus bounded retries on transient failures.
+
+        The real bound is RETRY_BUDGET_SEC, not MAX_ATTEMPTS: the deadline is
+        taken before the first call, so all MAX_ATTEMPTS attempts only happen
+        when the failures are fast. One slow answer eats the budget and the
+        first failure is then returned as-is, which keeps the total wait
+        predictable for the app's watchdog.
+        """
         call = getattr(self._session, method)
         deadline = time.monotonic() + RETRY_BUDGET_SEC
         delay = RETRY_BASE_DELAY
@@ -352,8 +368,12 @@ class GeminiClient:
         detail = response.text[:DETAIL_LIMIT] if response.text else ""
         return _error_for_status(response.status_code, detail)
 
-    def _upload_file(self, audio_wav: bytes) -> tuple[str, str | None]:
-        """Resumable Files API upload, used only for oversized recordings."""
+    def _upload_file(self, audio_wav: bytes) -> tuple[str, str | None, dict[str, Any]]:
+        """Resumable Files API upload, used only for oversized recordings.
+
+        Returns (uri, name, file resource). The caller awaits activation, so
+        that an upload which never becomes usable can still be deleted.
+        """
         start_headers = {
             "x-goog-api-key": self._api_key,
             "X-Goog-Upload-Protocol": "resumable",
@@ -410,9 +430,7 @@ class GeminiClient:
         if not isinstance(uri, str) or not uri:
             raise MalformedResponseError(detail="upload response has no file uri")
         name = name if isinstance(name, str) and name else None
-
-        self._await_active(file_info, name)
-        return uri, name
+        return uri, name, file_info
 
     @staticmethod
     def _file_resource(payload: Any) -> dict[str, Any]:

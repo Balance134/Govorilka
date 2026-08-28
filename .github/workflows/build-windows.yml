@@ -46,10 +46,8 @@ jobs:
           ls -lh dist/VoiceDictation.exe
           # Без PortAudio программа запустится и умрёт на первой же диктовке,
           # поэтому отсутствие библиотеки — это провал сборки, а не предупреждение.
-          if grep -qi "portaudio shared library not found" pyinstaller.log; then
-            echo "PortAudio DLL не попала в сборку" >&2
-            exit 1
-          fi
+          # Единственная настоящая проверка — список файлов сборки (.toc):
+          # PyInstaller молча не кладёт DLL, никакого сообщения в лог не пишет.
           if ! grep -rqi "libportaudio" build/VoiceDictation/*.toc; then
             echo "PortAudio DLL не найдена в списке файлов сборки" >&2
             exit 1

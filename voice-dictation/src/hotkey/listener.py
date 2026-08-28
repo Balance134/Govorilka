@@ -30,6 +30,9 @@ WM_QUIT = 0x0012
 HC_ACTION = 0
 LLKHF_INJECTED = 0x10
 
+# How long start() waits for the hook thread to report back.
+HOOK_READY_TIMEOUT_SEC = 5.0
+
 # Every virtual key code that belongs to some modifier family, regardless of
 # the hotkey in effect - foreign modifiers must be tracked too.
 ALL_MODIFIER_VKS: frozenset[int] = frozenset(
@@ -104,12 +107,19 @@ class HotkeyListener:
         self._down_keys: set[int] = set()  # physically held non-modifier keys
         self._lock = threading.Lock()
         self._ready = threading.Event()
+        self._cancelled = threading.Event()
+        self._active = False
         self._install_error: str | None = None
 
     # ---------------------------------------------------------------- public
     @property
     def hotkey(self) -> Hotkey:
         return self._hotkey
+
+    @property
+    def is_running(self) -> bool:
+        """True only while a hook of ours is known to be installed."""
+        return self._active
 
     def set_hotkey(self, hotkey: Hotkey) -> None:
         """Applied on the fly; a combination held right now is released first."""
@@ -126,26 +136,43 @@ class HotkeyListener:
         if not _IS_WINDOWS:
             raise RuntimeError("Клавиатурный хук доступен только в Windows")
         if self._thread is not None:
-            return
+            if self._active:
+                return
+            # A thread that outlived its start() or stop() may still install
+            # or hold a hook; a second one would double every keypress.
+            raise RuntimeError(
+                "Прошлый клавиатурный хук ещё не освободился. "
+                "Перезапустите программу"
+            )
         self._ready.clear()
+        self._cancelled.clear()
         self._install_error = None
         thread = threading.Thread(target=self._run, name="hotkey-hook", daemon=True)
         self._thread = thread
         thread.start()
-        if not self._ready.wait(timeout=5.0):
-            self._thread = None
+        if not self._ready.wait(timeout=HOOK_READY_TIMEOUT_SEC):
+            # The thread is still alive and may install the hook a moment from
+            # now. Ask it to unhook itself and keep the reference, so a later
+            # start() refuses instead of adding a second hook.
+            self._cancelled.set()
             raise RuntimeError(
                 "Клавиатурный хук не запустился за 5 секунд. "
                 "Перезапустите программу"
             )
         if self._install_error is not None:
             thread.join(timeout=1.0)
-            self._thread = None
-            self._thread_id = 0
+            if thread.is_alive():
+                self._cancelled.set()
+            else:
+                self._thread = None
+                self._thread_id = 0
             raise RuntimeError(self._install_error)
+        self._active = True
 
     def stop(self) -> None:
         thread = self._thread
+        self._active = False
+        self._cancelled.set()
         if thread is None:
             return
         if _IS_WINDOWS and self._thread_id:  # pragma: no cover - Windows only
@@ -178,6 +205,15 @@ class HotkeyListener:
         finally:
             self._ready.set()
         if self._install_error is not None:
+            return
+        if self._cancelled.is_set():
+            # start() gave up waiting: unhook right away instead of leaving an
+            # orphan hook behind that keeps firing callbacks.
+            log.warning("Hook installed after start() gave up, removing it")
+            if self._hook:
+                user32.UnhookWindowsHookEx(self._hook)
+            self._hook = None
+            self._proc = None
             return
 
         try:

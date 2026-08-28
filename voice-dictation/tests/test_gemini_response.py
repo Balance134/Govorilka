@@ -1,3 +1,7 @@
+import ast
+import math
+from pathlib import Path
+
 import pytest
 import requests
 
@@ -423,3 +427,68 @@ def test_missing_key_differs_from_a_wrong_key():
         gemini_client.GeminiClient("").transcribe(b"x", [], [])
     assert info.value.message == "Ключ Gemini API не указан — откройте настройки"
     assert isinstance(info.value, AuthError)
+
+
+# ------------------------------------------- the upload path must stay alive
+
+def _recorder_constants() -> dict[str, float]:
+    """Recorder numbers without importing it.
+
+    sounddevice is a Windows/PortAudio dependency and is not installed on every
+    machine that runs the suite, while only the arithmetic matters here.
+    """
+    source = Path(gemini_client.__file__).resolve().parents[1] / "audio" / "recorder.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    values: dict[str, float] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            try:
+                values[node.targets[0].id] = ast.literal_eval(node.value)
+            except ValueError:
+                continue
+    return values
+
+
+def test_a_maximum_length_recording_really_goes_through_the_files_api():
+    # If the recorder's cap ever drops below the inline limit, the whole upload
+    # path becomes dead code that production can never reach.
+    numbers = _recorder_constants()
+    wav_bytes = (
+        numbers["MAX_DURATION_SEC"]
+        * numbers["SAMPLE_RATE"]
+        * numbers["SAMPLE_WIDTH"]
+        * numbers["CHANNELS"]
+    )
+    base64_bytes = math.ceil(wav_bytes / 3) * 4
+    assert base64_bytes > gemini_client.INLINE_LIMIT_BYTES
+
+
+def test_the_inline_limit_stays_inside_the_20_mb_request_cap():
+    assert gemini_client.INLINE_LIMIT_BYTES <= 15 * 1024 * 1024
+
+
+def test_a_file_stuck_in_processing_is_deleted_not_left_on_google(monkeypatch):
+    client = gemini_client.GeminiClient("key")
+    monkeypatch.setattr(gemini_client, "FILE_ACTIVE_DEADLINE_SEC", 0.0)
+    calls = _files_api(
+        monkeypatch,
+        client,
+        file_info={"uri": "files/abc", "name": "files/abc", "state": "PROCESSING"},
+        poll_states=["PROCESSING"] * 10,
+    )
+    with pytest.raises(FileProcessingError):
+        client.transcribe(b"x" * 100, [], [])
+    assert [method for method, _, _ in calls] == ["post", "post", "delete"]
+    assert calls[-1][1] == f"{gemini_client.FILES_URL}/files/abc"
+
+
+def test_a_file_that_comes_back_failed_is_deleted_too(monkeypatch):
+    client = gemini_client.GeminiClient("key")
+    calls = _files_api(
+        monkeypatch,
+        client,
+        file_info={"uri": "files/abc", "name": "files/abc", "state": "FAILED"},
+    )
+    with pytest.raises(FileProcessingError):
+        client.transcribe(b"x" * 100, [], [])
+    assert [method for method, _, _ in calls] == ["post", "post", "delete"]

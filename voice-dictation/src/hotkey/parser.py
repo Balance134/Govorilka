@@ -124,7 +124,8 @@ STANDALONE_KEYS = {f"f{i}" for i in range(1, 25)}
 # keyboard lock or fire a system action, and the capture widget never
 # produces them either.
 LOCK_KEYS = {"capslock", "numlock", "scrolllock"}
-UNUSABLE_MAIN_KEYS = LOCK_KEYS | {"printscreen"}
+SYSTEM_KEYS = {"printscreen"}
+UNUSABLE_MAIN_KEYS = LOCK_KEYS | SYSTEM_KEYS
 
 
 class HotkeyError(ValueError):
@@ -219,7 +220,7 @@ def _reject_unusable_key(hotkey: Hotkey) -> None:
             f"Клавиша {hotkey.key} не подходит для диктовки — "
             "её удержание переключает режим клавиатуры"
         )
-    if hotkey.key in UNUSABLE_MAIN_KEYS:
+    if hotkey.key in SYSTEM_KEYS:
         raise HotkeyError(
             f"Клавиша {hotkey.key} не подходит для диктовки — "
             "её обрабатывает сама Windows"

@@ -303,7 +303,7 @@ def get_clipboard_text() -> str | None:
 
 
 def set_clipboard_text(text: str) -> None:
-    """Replaces the clipboard with `text`.
+    """Replaces the clipboard with `text`, normalised to CR LF for pasting.
 
     Only CF_UNICODETEXT is handled here and in get_clipboard_text(): an image,
     a file list or rich text sitting on the clipboard is destroyed by
@@ -311,9 +311,19 @@ def set_clipboard_text(text: str) -> None:
     every format would mean rendering delayed formats too, which is far more
     machinery than a dictation tool needs.
     """
+    _write_clipboard(normalize_newlines(text))
+
+
+def _write_clipboard(text: str) -> None:
+    """Writes `text` verbatim.
+
+    Restoring the user's own clipboard goes through here and not through
+    set_clipboard_text(): their copied code or JSON is data the app does not
+    own, and turning its bare U+000A into CR LF would be a silent edit.
+    """
     if not _IS_WINDOWS:
         return
-    data = ctypes.create_unicode_buffer(normalize_newlines(text))
+    data = ctypes.create_unicode_buffer(text)
     size = ctypes.sizeof(data)
     handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, size)
     if not handle:
@@ -374,7 +384,7 @@ def paste_via_clipboard(text: str) -> None:
             if pasted:
                 time.sleep(CLIPBOARD_RESTORE_DELAY)
             try:
-                set_clipboard_text(previous)
+                _write_clipboard(previous)
             except InjectionError:
                 log.debug("Could not restore the previous clipboard content", exc_info=True)
 

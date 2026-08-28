@@ -188,8 +188,16 @@ def apply_replacements(text: str, rules: Iterable[ReplacementRule]) -> str:
 
     def substitute(match: "re.Match[str]") -> str:
         matched = match.group(0)
+        target = targets.get(_variant_key(matched))
+        if target is None:
+            # IGNORECASE and casefold() do not agree for characters whose case
+            # folding expands: "İstanbul".casefold() is "i" + U+0307 while the
+            # alternation happily matches plain "istanbul". A missed lookup
+            # leaves the text as the model wrote it - losing a finished
+            # dictation to a KeyError would be far worse than a missed rule.
+            return matched
         # Written literally: a target containing \1 must not become a backreference.
-        return _apply_casing(matched, targets[_variant_key(matched)])
+        return _apply_casing(matched, target)
 
     return pattern.sub(substitute, text)
 
