@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config.model import AppConfig, PASTE_MODES
+from ..config.model import AppConfig, PASTE_MODES, TRANSCRIPTION_MODES
 from ..config.vocabulary import (
     ValidationError,
     build_api_vocabulary,
@@ -40,6 +40,11 @@ log = logging.getLogger(__name__)
 PASTE_MODE_LABELS = {
     "clipboard": "Через буфер обмена (быстро, рекомендуется)",
     "sendinput": "Посимвольно (для полей, где вставка запрещена)",
+}
+
+TRANSCRIPTION_MODE_LABELS = {
+    "smart": "Причёсывать (убирать «э-э», исправлять оговорки)",
+    "verbatim": "Дословно (что сказал, то и получишь)",
 }
 
 
@@ -112,6 +117,19 @@ class SettingsWindow(QWidget):
             self.paste_mode_box.addItem(PASTE_MODE_LABELS[mode], mode)
         form.addRow("Способ вставки", self.paste_mode_box)
 
+        self.transcription_mode_box = QComboBox()
+        for mode in TRANSCRIPTION_MODES:
+            self.transcription_mode_box.addItem(TRANSCRIPTION_MODE_LABELS[mode], mode)
+        form.addRow("Обработка текста", self.transcription_mode_box)
+        transcription_hint = QLabel(
+            "«Причёсывать» — Gemini переписывает сказанное для чтения: убирает "
+            "слова-паразиты, правит грамматику, раскладывает по абзацам. Иногда "
+            "при этом меняется смысл. «Дословно» — текст ровно такой, как "
+            "прозвучал, вместе с запинками."
+        )
+        transcription_hint.setWordWrap(True)
+        form.addRow("", transcription_hint)
+
         self.autodetect_box = QCheckBox("Определять язык автоматически")
         self.autodetect_box.setChecked(True)
         self.autodetect_box.toggled.connect(self._toggle_languages)
@@ -148,6 +166,8 @@ class SettingsWindow(QWidget):
         self.hotkey_edit.set_hotkey_text(config.hotkey)
         index = self.paste_mode_box.findData(config.paste_mode)
         self.paste_mode_box.setCurrentIndex(index if index >= 0 else 0)
+        mode_index = self.transcription_mode_box.findData(config.transcription_mode)
+        self.transcription_mode_box.setCurrentIndex(mode_index if mode_index >= 0 else 0)
         auto = not config.language_codes
         self.autodetect_box.setChecked(auto)
         self.languages_edit.setText(", ".join(config.language_codes))
@@ -184,6 +204,7 @@ class SettingsWindow(QWidget):
             hotkey=hotkey.to_string(),
             language_codes=language_codes,
             paste_mode=self.paste_mode_box.currentData() or "clipboard",
+            transcription_mode=self.transcription_mode_box.currentData() or "smart",
         )
 
     def _on_save(self) -> None:

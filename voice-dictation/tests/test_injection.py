@@ -84,8 +84,39 @@ def test_nothing_held_means_no_events():
 
 def test_right_side_modifiers_are_released_by_their_own_vk():
     assert _plan([typer.VK_RCONTROL]) == [(typer.VK_RCONTROL, True)]
-    assert _plan([typer.VK_RMENU]) == [(typer.VK_RMENU, True)]
     assert _plan([typer.VK_RSHIFT]) == [(typer.VK_RSHIFT, True)]
+    # Right Alt is the one exception: on its own it needs the neutralising tap.
+    assert _plan([typer.VK_RMENU])[-1] == (typer.VK_RMENU, True)
+
+
+def test_alt_is_released_before_ctrl():
+    plan = _plan([typer.VK_LCONTROL, typer.VK_LMENU])
+    releases = [vk for vk, key_up in plan if key_up]
+    # An Alt-up while Ctrl is still down cannot be read as menu activation.
+    assert releases.index(typer.VK_LMENU) < releases.index(typer.VK_LCONTROL)
+
+
+def test_alt_with_ctrl_held_needs_no_neutralising_tap():
+    plan = _plan([typer.VK_LCONTROL, typer.VK_LMENU])
+    assert plan == [(typer.VK_LMENU, True), (typer.VK_LCONTROL, True)]
+
+
+@pytest.mark.parametrize("alt", [typer.VK_LMENU, typer.VK_RMENU])
+def test_lone_alt_release_is_preceded_by_a_neutralising_tap(alt):
+    plan = _plan([alt])
+    assert plan == [
+        (typer.VK_CONTROL, False),
+        (typer.VK_CONTROL, True),
+        (alt, True),
+    ]
+    # The tap must happen while Alt is still down: a bare Alt-up activates the
+    # focused window's menu bar and the text field loses focus.
+    assert plan.index((typer.VK_CONTROL, True)) < plan.index((alt, True))
+
+
+def test_alt_with_shift_only_still_gets_the_tap():
+    plan = _plan([typer.VK_LMENU, typer.VK_LSHIFT])
+    assert plan[:2] == [(typer.VK_CONTROL, False), (typer.VK_CONTROL, True)]
 
 
 def test_both_sides_are_released_when_both_are_held():
@@ -228,6 +259,11 @@ def pretend_windows(monkeypatch):
     monkeypatch.setattr(typer, "_IS_WINDOWS", True)
     monkeypatch.setattr(typer, "_write_clipboard", lambda text: events.append(("write", text)))
     monkeypatch.setattr(typer, "release_stuck_modifiers", lambda: None)
+    monkeypatch.setattr(
+        typer,
+        "wait_for_clipboard",
+        lambda expected, read: events.append(("settle", expected)) or True,
+    )
     monkeypatch.setattr(typer, "_vk_input", lambda vk, key_up: (vk, key_up), raising=False)
     monkeypatch.setattr(typer, "_send", lambda inputs: events.append(("paste", inputs)),
                         raising=False)
@@ -257,8 +293,8 @@ def test_clipboard_is_restored_only_after_the_paste_had_time_to_land(
     monkeypatch.setattr(typer, "get_clipboard_text", lambda: "старое")
     typer.paste_via_clipboard("текст")
     kinds = [kind for kind, _ in pretend_windows]
-    assert kinds == ["write", "paste", "sleep", "write"]
-    delay = pretend_windows[2][1]
+    assert kinds == ["write", "settle", "paste", "sleep", "write"]
+    delay = pretend_windows[3][1]
     # Restoring before the target application has pasted means it pastes the
     # old text instead of the transcript.
     assert delay >= 1.0
@@ -274,5 +310,110 @@ def test_clipboard_is_restored_even_when_the_paste_fails(monkeypatch, pretend_wi
     with pytest.raises(typer.InjectionError):
         typer.paste_via_clipboard("текст")
     # No point waiting when nothing was pasted, but the content must come back.
-    assert [kind for kind, _ in pretend_windows] == ["write", "write"]
+    assert [kind for kind, _ in pretend_windows] == ["write", "settle", "write"]
     assert pretend_windows[-1] == ("write", "старое")
+
+
+# ------------------------------------------------------- clipboard settle
+
+class FakeClipboard:
+    """Clipboard that only starts reading back the new text after N reads.
+
+    Stands in for the real race: SetClipboardData returned, but the target
+    application cannot read the new content back yet.
+    """
+
+    def __init__(self, ready_after: int = 0, content: str = "старое") -> None:
+        self._ready_after = ready_after
+        self._content = content
+        self.reads = 0
+        self.written = None
+
+    def write(self, text: str) -> None:
+        self.written = text
+
+    def read(self) -> str | None:
+        self.reads += 1
+        if self.written is not None and self.reads > self._ready_after:
+            return self.written
+        return self._content
+
+
+class FakeClock:
+    """Monotonic clock that only moves when something sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.slept = []
+
+    def sleep(self, delay: float) -> None:
+        self.slept.append(delay)
+        self.now += delay
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _settle(clipboard, clock, timeout=typer.CLIPBOARD_SETTLE_TIMEOUT):
+    return typer.wait_for_clipboard(
+        clipboard.written,
+        clipboard.read,
+        sleep=clock.sleep,
+        clock=clock,
+        timeout=timeout,
+    )
+
+
+def test_settle_waits_a_beat_even_when_the_clipboard_reads_back_at_once():
+    clipboard = FakeClipboard(ready_after=0)
+    clipboard.write("текст")
+    clock = FakeClock()
+    assert _settle(clipboard, clock) is True
+    assert clipboard.reads == 1
+    assert clock.slept == [typer.CLIPBOARD_SETTLE_FLOOR]
+
+
+def test_settle_retries_until_the_write_reads_back():
+    clipboard = FakeClipboard(ready_after=3)
+    clipboard.write("текст")
+    clock = FakeClock()
+    assert _settle(clipboard, clock) is True
+    assert clipboard.reads == 4  # three misses, then the match
+    assert len(clock.slept) == 4  # the floor plus one poll per miss
+    assert clock.now < typer.CLIPBOARD_SETTLE_TIMEOUT
+
+
+def test_settle_gives_up_at_the_cap_and_lets_the_paste_go_ahead():
+    clipboard = FakeClipboard(ready_after=10_000)  # never reads back
+    clipboard.write("текст")
+    clock = FakeClock()
+    assert _settle(clipboard, clock) is False
+    # Capped, not endless: the user gets a paste attempt either way.
+    cap = (
+        typer.CLIPBOARD_SETTLE_FLOOR
+        + typer.CLIPBOARD_SETTLE_TIMEOUT
+        + typer.CLIPBOARD_SETTLE_POLL
+    )
+    assert clock.now <= cap
+    assert clipboard.reads < 100
+
+
+def test_settle_survives_a_clipboard_that_cannot_be_read():
+    def boom():
+        raise typer.InjectionError("занят")
+
+    clock = FakeClock()
+    assert typer.wait_for_clipboard(
+        "текст", boom, sleep=clock.sleep, clock=clock, timeout=0.05
+    ) is False
+
+
+def test_paste_settles_on_the_normalised_text_before_pressing_ctrl_v(
+    monkeypatch, pretend_windows
+):
+    monkeypatch.setattr(typer, "get_clipboard_text", lambda: None)
+    typer.paste_via_clipboard("одна\nдве")
+    kinds = [kind for kind, _ in pretend_windows]
+    assert kinds.index("settle") < kinds.index("paste")
+    settled = [value for kind, value in pretend_windows if kind == "settle"]
+    assert settled == ["одна\r\nдве"]

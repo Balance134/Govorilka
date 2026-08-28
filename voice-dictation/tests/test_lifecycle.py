@@ -8,6 +8,7 @@ the decisions their slots make are kept.
 """
 
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -21,6 +22,7 @@ if "sounddevice" not in sys.modules:  # pragma: no cover - depends on the box
 from src import app_logic
 from src.app_logic import (
     BAR_COUNT,
+    FIRST_BLOCK_TIMEOUT_SEC,
     CLIPBOARD_ONLY_NOTICE,
     HISTORY_HINT,
     BAR_DECAY_PER_FRAME,
@@ -36,6 +38,7 @@ from src.app_logic import (
     busy_message,
     capture_target_window,
     decide_stop,
+    format_first_audio_wait,
     decide_text_ready,
     format_timings,
     late_result_notice,
@@ -43,6 +46,7 @@ from src.app_logic import (
     peak_to_level,
     safe_apply_replacements,
     timings_belong_to,
+    wait_for_first_audio,
     with_history_hint,
 )
 from src.audio import recorder as recorder_module
@@ -605,3 +609,111 @@ def test_every_ending_of_a_dictation_logs_the_timings():
         assert "_log_timings(injected=False)" in app_source(method)
     assert "_log_timings()" in app_source("_on_injected")
     assert "_log_timings()" in app_source("_on_clipboard_only")
+
+
+# ------------------------------------- the cue must not run ahead of the audio
+def test_a_fresh_take_has_no_audio_yet(rec):
+    rec.start()
+    assert rec.wait_for_first_block(0) is False
+    assert rec.first_block_delay() is None
+
+
+def test_the_first_block_raises_the_flag_and_is_measured(rec):
+    rec.start()
+    feed(rec, 1)
+    assert rec.wait_for_first_block(0) is True
+    delay = rec.first_block_delay()
+    assert delay is not None and delay >= 0
+
+
+def test_the_delay_is_the_first_block_not_the_last(rec):
+    rec.start()
+    feed(rec, 1)
+    first = rec.first_block_delay()
+    feed(rec, 5)
+    assert rec.first_block_delay() == first
+
+
+def test_the_next_take_starts_without_audio_again(rec):
+    rec.start()
+    feed(rec, 5)
+    rec.stop()
+    rec.start()
+    assert rec.wait_for_first_block(0) is False
+    assert rec.first_block_delay() is None
+
+
+def test_an_aborted_take_lowers_the_flag_too(rec):
+    rec.start()
+    feed(rec, 5)
+    rec.abort()
+    assert rec.wait_for_first_block(0) is False
+
+
+def test_a_silent_device_does_not_hold_the_caller_forever(rec):
+    """No block ever arrives: the wait must end at the cap, not hang."""
+    rec.start()
+    started = time.monotonic()
+    assert rec.wait_for_first_block(0.05) is False
+    assert time.monotonic() - started < 2.0
+
+
+def test_waiting_for_audio_reports_how_long_it_took():
+    ticks = iter([10.0, 10.12])
+    waited = wait_for_first_audio(lambda timeout: True, clock=lambda: next(ticks))
+    assert waited.got_audio is True
+    assert waited.seconds == pytest.approx(0.12)
+
+
+def test_waiting_for_audio_passes_the_cap_down_to_the_recorder():
+    seen = []
+
+    def wait(timeout):
+        seen.append(timeout)
+        return False
+
+    waited = wait_for_first_audio(wait, clock=lambda: 0.0)
+    assert seen == [FIRST_BLOCK_TIMEOUT_SEC]
+    assert waited.got_audio is False
+
+
+def test_the_cap_is_short_enough_to_stay_out_of_the_way():
+    # Long enough for a Bluetooth headset to come up, short enough that a dead
+    # microphone still gets its cue almost at once.
+    assert 0.1 <= FIRST_BLOCK_TIMEOUT_SEC <= 1.0
+
+
+def test_the_log_line_carries_the_real_number():
+    line = format_first_audio_wait(wait_for_first_audio(lambda t: True, clock=iter([0.0, 0.137]).__next__))
+    assert "137 ms" in line
+    timed_out = format_first_audio_wait(
+        wait_for_first_audio(lambda t: False, clock=iter([0.0, 0.4]).__next__)
+    )
+    assert "no audio" in timed_out
+
+
+def test_the_cue_is_played_only_after_the_microphone_delivers_audio():
+    """Beeping before the stream runs tells the user to speak into nothing:
+    the opening words land in a device that is not capturing yet."""
+    body = app_source("_start_recording")
+    assert body.index("self._recorder.start()") < body.index("wait_for_first_audio")
+    assert body.index("wait_for_first_audio") < body.index("sounds.play_start()")
+
+
+def test_the_overlay_and_the_hotkey_cap_still_start_before_the_wait():
+    """The state change owns both, and it must not move behind a wait that can
+    last the whole cap."""
+    body = app_source("_start_recording")
+    assert body.index("AppState.RECORDING") < body.index("self._recorder.start()")
+
+
+def test_the_chosen_transcription_mode_reaches_the_worker():
+    """A setting the user can see but that never leaves the coordinator is
+    worse than no setting: it looks obeyed and is not."""
+    body = app_source("_stop_recording")
+    assert "self._config.transcription_mode" in body
+
+
+def test_the_worker_hands_the_mode_to_the_client():
+    body = app_source("run")
+    assert "self._transcription_mode" in body

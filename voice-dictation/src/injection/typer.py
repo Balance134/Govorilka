@@ -46,8 +46,22 @@ EXTENDED_KEYS = frozenset({VK_RCONTROL, VK_RMENU, VK_RWIN})
 
 # Side-specific virtual keys, so that a held Right Ctrl or AltGr is released
 # too. The generic VK_CONTROL/VK_MENU/VK_SHIFT map to the left key only.
-SIDED_MODIFIERS = (VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU, VK_LSHIFT, VK_RSHIFT)
+ALT_KEYS = (VK_LMENU, VK_RMENU)
+CTRL_KEYS = (VK_LCONTROL, VK_RCONTROL)
+SHIFT_KEYS = (VK_LSHIFT, VK_RSHIFT)
+# Alt is let go of first: an Alt-up that arrives while Ctrl is still down
+# cannot be read as "activate the menu bar" by the target window.
+SIDED_MODIFIERS = ALT_KEYS + CTRL_KEYS + SHIFT_KEYS
 WIN_KEYS = (VK_LWIN, VK_RWIN)
+
+# Settle time between writing the clipboard and sending Ctrl+V. The target
+# application reads CF_UNICODETEXT after the keystroke reaches it, so a paste
+# fired the same instant as the write can land before the new content is
+# readable - reported as a successful paste that inserted nothing. The write is
+# read back until it matches instead of guessing a delay from the length.
+CLIPBOARD_SETTLE_FLOOR = 0.01
+CLIPBOARD_SETTLE_TIMEOUT = 0.2
+CLIPBOARD_SETTLE_POLL = 0.01
 
 # How long to wait before putting the user's own clipboard content back.
 # The target application pastes asynchronously: restoring too early means it
@@ -184,7 +198,16 @@ def text_to_key_events(text: str) -> list[tuple[str, int]]:
 
 def modifier_release_plan(is_down: Callable[[int], bool]) -> list[tuple[int, bool]]:
     """(vk, key_up) events that let go of every modifier the user still holds."""
-    events: list[tuple[int, bool]] = [(vk, True) for vk in SIDED_MODIFIERS if is_down(vk)]
+    events: list[tuple[int, bool]] = []
+    if any(is_down(vk) for vk in ALT_KEYS) and not any(is_down(vk) for vk in CTRL_KEYS):
+        # An Alt released with nothing else held activates the focused window's
+        # menu bar, which takes the focus off the text field the transcript is
+        # meant for. The same Ctrl tap that neutralises the Win key below makes
+        # the press a chord instead. With Ctrl held the tap is not needed: Alt
+        # goes up first and Ctrl masks it.
+        events.append((VK_CONTROL, False))
+        events.append((VK_CONTROL, True))
+    events.extend((vk, True) for vk in SIDED_MODIFIERS if is_down(vk))
     held_win = [vk for vk in WIN_KEYS if is_down(vk)]
     if held_win:
         # Releasing a lone Win key opens the Start menu, which steals focus and
@@ -241,6 +264,39 @@ def release_stuck_modifiers() -> None:
     if plan:
         _send([_vk_input(vk, key_up=key_up) for vk, key_up in plan])
         time.sleep(0.02)
+
+
+def wait_for_clipboard(
+    expected: str,
+    read: Callable[[], str | None],
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    timeout: float = CLIPBOARD_SETTLE_TIMEOUT,
+    floor: float = CLIPBOARD_SETTLE_FLOOR,
+    poll: float = CLIPBOARD_SETTLE_POLL,
+) -> bool:
+    """Blocks until the clipboard reads back as `expected`, capped at `timeout`.
+
+    Returns whether it ever matched. A miss is not fatal: pasting is still the
+    best move left, and it is only ever late, never wrong.
+    """
+    sleep(floor)  # a clipboard that reads back at once still gets a beat
+    deadline = clock() + timeout
+    while True:
+        try:
+            current = read()
+        except InjectionError:
+            log.debug("Could not read the clipboard back", exc_info=True)
+            current = None
+        if current == expected:
+            return True
+        if clock() >= deadline:
+            log.warning(
+                "Clipboard did not read back within %.0f ms, pasting anyway",
+                timeout * 1000,
+            )
+            return False
+        sleep(poll)
 
 
 # ---------------------------------------------------------------- clipboard
@@ -369,6 +425,9 @@ def paste_via_clipboard(text: str) -> None:
     pasted = False
     try:
         set_clipboard_text(text)
+        # set_clipboard_text normalises, so the read back is compared against
+        # what actually went onto the clipboard.
+        wait_for_clipboard(normalize_newlines(text), get_clipboard_text)
         release_stuck_modifiers()
         _send([
             _vk_input(VK_CONTROL, key_up=False),

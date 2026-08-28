@@ -3,7 +3,13 @@ import json
 import pytest
 
 from src.config import paths, store
-from src.config.model import DEFAULT_HOTKEY, AppConfig, ReplacementRule
+from src.config.model import (
+    DEFAULT_HOTKEY,
+    DEFAULT_LANGUAGE_CODES,
+    DEFAULT_TRANSCRIPTION_MODE,
+    AppConfig,
+    ReplacementRule,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -29,6 +35,8 @@ def test_first_run_creates_config_with_empty_key():
     assert config.hotkey == DEFAULT_HOTKEY
     assert paths.config_file().exists()
     assert "Claude Code" in config.vocabulary
+    assert config.language_codes == ["ru-RU"]
+    assert config.transcription_mode == "smart"
 
 
 def test_round_trip_preserves_everything():
@@ -37,8 +45,9 @@ def test_round_trip_preserves_everything():
         vocabulary=["n8n", "Supabase"],
         replacements=[ReplacementRule("n8n", ["эн восемь эн"])],
         hotkey="ctrl+shift+f9",
-        language_codes=["ru-RU"],
+        language_codes=["en-US"],
         paste_mode="sendinput",
+        transcription_mode="verbatim",
     )
     store.save(original)
     loaded = store.load()
@@ -54,8 +63,38 @@ def test_migration_ignores_unknown_and_fills_missing():
     assert config.api_key == "k"
     assert config.hotkey == DEFAULT_HOTKEY
     assert config.paste_mode == "clipboard"
-    assert config.language_codes == []
+    assert config.transcription_mode == DEFAULT_TRANSCRIPTION_MODE
+    # No language_codes key at all - a fresh or hand-trimmed config: it gets
+    # the Russian default. An explicit empty list is a different story, below.
+    assert config.language_codes == DEFAULT_LANGUAGE_CODES == ["ru-RU"]
     assert config.vocabulary  # defaults restored
+
+
+def test_explicit_auto_detect_is_not_overwritten_by_the_new_default():
+    """An empty list is the user's own choice and must survive the upgrade."""
+    paths.ensure_dirs()
+    paths.config_file().write_text(
+        json.dumps({"api_key": "k", "language_codes": []}), encoding="utf-8"
+    )
+    config = store.load()
+    assert config.language_codes == []
+    store.save(config)
+    assert store.load().language_codes == []
+
+
+def test_unknown_transcription_mode_falls_back_to_the_default():
+    paths.ensure_dirs()
+    paths.config_file().write_text(
+        json.dumps({"api_key": "k", "transcription_mode": "полудословно"}),
+        encoding="utf-8",
+    )
+    assert store.load().transcription_mode == DEFAULT_TRANSCRIPTION_MODE
+
+
+def test_both_transcription_modes_survive_a_round_trip():
+    for mode in ("smart", "verbatim"):
+        store.save(AppConfig(api_key="k", transcription_mode=mode))
+        assert store.load().transcription_mode == mode
 
 
 def _broken_backups():

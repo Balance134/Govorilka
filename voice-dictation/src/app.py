@@ -28,9 +28,11 @@ from .app_logic import (
     capture_target_window,
     decide_stop,
     decide_text_ready,
+    format_first_audio_wait,
     late_result_notice,
     safe_apply_replacements,
     timings_belong_to,
+    wait_for_first_audio,
     with_history_hint,
 )
 from .audio import sounds
@@ -104,6 +106,7 @@ class TranscribeWorker(QThread):
         audio_wav: bytes,
         vocabulary: list[str],
         language_codes: list[str],
+        transcription_mode: str,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -111,11 +114,15 @@ class TranscribeWorker(QThread):
         self._audio = audio_wav
         self._vocabulary = vocabulary
         self._language_codes = language_codes
+        self._transcription_mode = transcription_mode
 
     def run(self) -> None:
         try:
             text = self._client.transcribe(
-                self._audio, self._vocabulary, self._language_codes
+                self._audio,
+                self._vocabulary,
+                self._language_codes,
+                self._transcription_mode,
             )
         except TranscriptionError as exc:
             if exc.detail:
@@ -320,6 +327,7 @@ class DictationApp(QObject):
                 on_press=self.hotkeyPressed.emit,
                 on_release=self.hotkeyReleased.emit,
                 on_cancel=self.hotkeyCancelled.emit,
+                on_hook_lost=self.errorReported.emit,
             )
         listener = self._listener
         listener.set_hotkey(hotkey)
@@ -423,14 +431,17 @@ class DictationApp(QObject):
         if not self._state.to(AppState.RECORDING):
             return
         self._target_hwnd = target_hwnd
-        # Beep first: opening a WASAPI device takes up to a few hundred
-        # milliseconds and the user needs the cue when the key goes down.
-        sounds.play_start()
         try:
             self._recorder.start()
         except MicrophoneError as exc:
             self._fail(str(exc))
             return
+        # Open the device first, then cue the user: a beep that arrives while
+        # the stream is still starting invites the user to speak into nothing.
+        # The wait is capped, so a device that never delivers still beeps.
+        waited = wait_for_first_audio(self._recorder.wait_for_first_block)
+        log.info("%s", format_first_audio_wait(waited))
+        sounds.play_start()
 
     def _cancel_recording(self) -> None:
         """The hotkey turned out to be a shortcut's modifier: drop the take."""
@@ -485,7 +496,12 @@ class DictationApp(QObject):
         generation = self._take.begin()
         vocabulary = build_api_vocabulary(self._config.vocabulary, self._config.replacements)
         worker = TranscribeWorker(
-            self._client, recording.wav, vocabulary, list(self._config.language_codes), self
+            self._client,
+            recording.wav,
+            vocabulary,
+            list(self._config.language_codes),
+            self._config.transcription_mode,
+            self,
         )
         worker.succeeded.connect(
             lambda text, gen=generation: self._on_text_ready(text, gen)

@@ -12,9 +12,12 @@ from typing import Any
 from . import paths
 from .model import (
     DEFAULT_HOTKEY,
+    DEFAULT_LANGUAGE_CODES,
     DEFAULT_PASTE_MODE,
+    DEFAULT_TRANSCRIPTION_MODE,
     DEFAULT_VOCABULARY,
     PASTE_MODES,
+    TRANSCRIPTION_MODES,
     AppConfig,
     ReplacementRule,
 )
@@ -55,11 +58,22 @@ def from_dict(raw: Any) -> AppConfig:
     hotkey = raw.get("hotkey")
     config.hotkey = hotkey.strip() if isinstance(hotkey, str) and hotkey.strip() else DEFAULT_HOTKEY
 
+    # A list that is already there wins, even when empty: an empty list is the
+    # user's own "detect the language automatically" and must survive the
+    # arrival of the Russian default. Only a config without the key at all -
+    # a fresh one, or one hand-edited down - gets the new default.
     language_codes = raw.get("language_codes")
     if isinstance(language_codes, list):
         config.language_codes = [item for item in language_codes if isinstance(item, str)]
     else:
-        config.language_codes = []
+        config.language_codes = list(DEFAULT_LANGUAGE_CODES)
+
+    transcription_mode = raw.get("transcription_mode")
+    config.transcription_mode = (
+        transcription_mode
+        if transcription_mode in TRANSCRIPTION_MODES
+        else DEFAULT_TRANSCRIPTION_MODE
+    )
 
     paste_mode = raw.get("paste_mode")
     config.paste_mode = paste_mode if paste_mode in PASTE_MODES else DEFAULT_PASTE_MODE

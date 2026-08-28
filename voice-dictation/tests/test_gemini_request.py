@@ -28,25 +28,46 @@ def test_endpoint_and_model():
     assert "live" not in gemini_client.MODEL
 
 
-def test_mode_is_the_string_smart():
+AUDIO_SHAPES = [
+    {"audio_b64": "QUJD"},
+    {"audio_b64": None, "file_uri": "files/abc"},
+]
+
+
+def test_smart_is_the_default_mode():
     config = body()["generation_config"]["transcription_config"]
     assert config["mode"] == "smart"
     assert isinstance(config["mode"], str)
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"audio_b64": "QUJD"},
-        {"audio_b64": None, "file_uri": "files/abc"},
-    ],
-)
-def test_smart_mode_incompatible_fields_are_absent(kwargs):
-    built = body(**kwargs)
-    payload = json.dumps(built)
-    assert built["generation_config"]["transcription_config"]["mode"] == "smart"
+@pytest.mark.parametrize("shape", AUDIO_SHAPES)
+def test_configured_mode_is_what_gets_sent(shape):
+    """Both documented modes, in both body shapes.
+
+    "smart" travels as the bare string and "verbatim" as {"type": "verbatim"} -
+    the only shape https://ai.google.dev/gemini-api/docs/transcribe shows it in.
+    """
+    smart = body(transcription_mode="smart", **shape)
+    verbatim = body(transcription_mode="verbatim", **shape)
+    assert smart["generation_config"]["transcription_config"]["mode"] == "smart"
+    assert verbatim["generation_config"]["transcription_config"]["mode"] == {
+        "type": "verbatim"
+    }
+
+
+@pytest.mark.parametrize("shape", AUDIO_SHAPES)
+@pytest.mark.parametrize("mode", ["smart", "verbatim"])
+def test_incompatible_fields_are_absent_in_every_mode(shape, mode):
+    payload = json.dumps(body(transcription_mode=mode, **shape))
     assert "timestamp_granularities" not in payload
     assert "diarization_mode" not in payload
+
+
+def test_unknown_mode_never_reaches_the_api():
+    config = body(transcription_mode="полудословно")["generation_config"][
+        "transcription_config"
+    ]
+    assert config["mode"] == "smart"
 
 
 def test_inline_audio_shape():
@@ -108,9 +129,12 @@ def test_transcribe_sends_the_documented_request(monkeypatch):
     client = gemini_client.GeminiClient("test-key")
     monkeypatch.setattr(client._session, "post", fake_post)
 
-    text = client.transcribe(b"RIFFdata", ["n8n"], [])
+    text = client.transcribe(b"RIFFdata", ["n8n"], ["ru-RU"], "verbatim")
 
     assert text == "привет"
+    sent = captured["json"]["generation_config"]["transcription_config"]
+    assert sent["mode"] == {"type": "verbatim"}
+    assert sent["language_codes"] == ["ru-RU"]
     assert captured["url"] == gemini_client.INTERACTIONS_URL
     assert captured["headers"]["x-goog-api-key"] == "test-key"
     assert captured["headers"]["Content-Type"] == "application/json"
@@ -166,3 +190,34 @@ def test_both_upload_calls_carry_a_timeout(monkeypatch):
     finish_kwargs = calls[1][1]
     assert start_kwargs["timeout"] == (10, 120)
     assert finish_kwargs["timeout"] == (10, 180)
+
+
+def test_uploaded_audio_carries_the_chosen_mode(monkeypatch):
+    """The Files API branch builds its own body - it must not lose the mode."""
+    bodies = []
+
+    class _Start:
+        status_code = 200
+        text = ""
+        headers = {"x-goog-upload-url": "https://upload.example/session"}
+
+        def json(self):
+            return {}
+
+    def fake_post(url, json=None, **kwargs):
+        if url == gemini_client.UPLOAD_URL:
+            return _Start()
+        if url == "https://upload.example/session":
+            return _FakeResponse(payload={"file": {"uri": "files/abc", "name": "files/abc"}})
+        bodies.append(json)
+        return _FakeResponse()
+
+    client = gemini_client.GeminiClient("key")
+    monkeypatch.setattr(client._session, "post", fake_post)
+    monkeypatch.setattr(client._session, "delete", lambda *a, **k: _FakeResponse())
+    monkeypatch.setattr(gemini_client, "INLINE_LIMIT_BYTES", 10)
+
+    assert client.transcribe(b"x" * 100, [], [], "verbatim") == "привет"
+    sent = bodies[0]["generation_config"]["transcription_config"]
+    assert sent["mode"] == {"type": "verbatim"}
+    assert bodies[0]["input"][0]["uri"] == "files/abc"

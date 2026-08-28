@@ -9,11 +9,13 @@ https://ai.google.dev/gemini-api/docs/file-input-methods (checked 28.08.2026):
       "model": "gemini-3.5-transcribe",
       "input": [{"type": "audio", "data": "<base64>", "mime_type": "audio/wav"}],
       "generation_config": {"transcription_config": {
-          "mode": "smart", "custom_vocabulary": [...], "language_codes": []}}
+          "mode": "smart", "custom_vocabulary": [...], "language_codes": ["ru-RU"]}}
     }
 
-"smart" is a string and must not be combined with timestamp_granularities or
-diarization_mode - neither key is ever produced here.
+Two modes are documented: "smart" travels as the bare string, "verbatim" as
+{"type": "verbatim"} - the only shape the docs ever show it in. Neither carries
+timestamp_granularities or diarization_mode; those keys are never produced here,
+in any mode.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from typing import Any, Iterable
 
 import requests
 
+from ..config.model import DEFAULT_TRANSCRIPTION_MODE, TRANSCRIPTION_MODES
 from .errors import (
     AudioFormatError,
     AudioTooLargeError,
@@ -88,12 +91,27 @@ def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
+def mode_payload(transcription_mode: str) -> Any:
+    """Wire shape of ``mode``; an unknown value falls back to the default.
+
+    The fallback is the last gate before the API: a hand-edited config is
+    already filtered by config.store, but nothing unknown may leave here.
+    """
+    mode = (
+        transcription_mode
+        if transcription_mode in TRANSCRIPTION_MODES
+        else DEFAULT_TRANSCRIPTION_MODE
+    )
+    return "smart" if mode == "smart" else {"type": "verbatim"}
+
+
 def build_request_body(
     audio_b64: str | None,
     vocabulary: Iterable[str],
     language_codes: Iterable[str],
     *,
     file_uri: str | None = None,
+    transcription_mode: str = DEFAULT_TRANSCRIPTION_MODE,
 ) -> dict[str, Any]:
     """Pure request builder - unit tested, no I/O."""
     if (audio_b64 is None) == (file_uri is None):
@@ -113,7 +131,7 @@ def build_request_body(
         "input": [audio_input],
         "generation_config": {
             "transcription_config": {
-                "mode": "smart",
+                "mode": mode_payload(transcription_mode),
                 "custom_vocabulary": list(vocabulary),
                 "language_codes": list(language_codes),
             }
@@ -244,6 +262,7 @@ class GeminiClient:
         audio_wav: bytes,
         vocabulary: list[str],
         language_codes: list[str],
+        transcription_mode: str = DEFAULT_TRANSCRIPTION_MODE,
     ) -> str:
         if not self._api_key:
             raise MissingKeyError(detail="empty api key")
@@ -258,10 +277,19 @@ class GeminiClient:
                 # PROCESSING or comes back FAILED is still deleted below.
                 self._await_active(file_info, file_name)
                 body = build_request_body(
-                    None, vocabulary, language_codes, file_uri=file_uri
+                    None,
+                    vocabulary,
+                    language_codes,
+                    file_uri=file_uri,
+                    transcription_mode=transcription_mode,
                 )
             else:
-                body = build_request_body(audio_b64, vocabulary, language_codes)
+                body = build_request_body(
+                    audio_b64,
+                    vocabulary,
+                    language_codes,
+                    transcription_mode=transcription_mode,
+                )
             return self._run_interaction(body, len(audio_wav))
         finally:
             # The recording must not sit on Google for the 48 hours the Files

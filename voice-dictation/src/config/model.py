@@ -9,6 +9,18 @@ DEFAULT_HOTKEY = "ctrl+alt+space"
 DEFAULT_PASTE_MODE = "clipboard"
 PASTE_MODES = ("clipboard", "sendinput")
 
+# Transcription modes documented at https://ai.google.dev/gemini-api/docs/transcribe
+# (checked 28.08.2026): "verbatim" returns the words as spoken, "smart" rewrites
+# them for reading. Google's own default is verbatim; ours stays "smart" so the
+# behaviour users already have does not change under them.
+DEFAULT_TRANSCRIPTION_MODE = "smart"
+TRANSCRIPTION_MODES = ("smart", "verbatim")
+
+# Dictation is Russian with English technical terms sprinkled in. Naming the
+# language beats auto-detection, which can switch languages mid-phrase and even
+# translate. An empty list still means auto-detect and stays available.
+DEFAULT_LANGUAGE_CODES: list[str] = ["ru-RU"]
+
 DEFAULT_VOCABULARY: list[str] = [
     "n8n",
     "Supabase",
@@ -69,7 +81,10 @@ class AppConfig:
         ]
     )
     hotkey: str = DEFAULT_HOTKEY
-    language_codes: list[str] = field(default_factory=list)
+    language_codes: list[str] = field(
+        default_factory=lambda: list(DEFAULT_LANGUAGE_CODES)
+    )
+    transcription_mode: str = DEFAULT_TRANSCRIPTION_MODE
     paste_mode: str = DEFAULT_PASTE_MODE
     # Set by store.load() when a broken config.json was discarded; never saved.
     was_reset: bool = field(default=False, compare=False, repr=False)
@@ -81,6 +96,7 @@ class AppConfig:
             "replacements": [r.to_dict() for r in self.replacements],
             "hotkey": self.hotkey,
             "language_codes": list(self.language_codes),
+            "transcription_mode": self.transcription_mode,
             "paste_mode": self.paste_mode,
         }
 

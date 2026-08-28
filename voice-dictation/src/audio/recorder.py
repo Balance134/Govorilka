@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import logging
 import threading
+import time
 import wave
 from typing import NamedTuple, Optional
 
@@ -55,6 +56,12 @@ class Recorder:
         self._capped = False
         self._stopping = False
         self._peak = 0
+        # Set by the first callback of the take: opening a WASAPI device is not
+        # instant, and the caller cues the user to speak only once audio is
+        # really flowing.
+        self._first_block = threading.Event()
+        self._started_at: Optional[float] = None
+        self._first_block_delay: Optional[float] = None
 
     @property
     def is_recording(self) -> bool:
@@ -74,6 +81,9 @@ class Recorder:
             self._capped = False
             self._stopping = False
             self._peak = 0
+            self._started_at = None
+            self._first_block_delay = None
+        self._first_block.clear()
         try:
             # RawInputStream hands over plain bytes, so numpy is not needed.
             stream = sd.RawInputStream(
@@ -84,6 +94,8 @@ class Recorder:
                 callback=self._callback,
                 finished_callback=self._on_stream_finished,
             )
+            with self._lock:
+                self._started_at = time.monotonic()
             stream.start()
         except Exception as exc:  # sounddevice raises several unrelated types
             log.exception("Failed to open the input stream")
@@ -99,7 +111,10 @@ class Recorder:
             log.debug("Audio callback status: %s", status)
         chunk = bytes(indata)
         peak = block_peak(chunk)
+        self._first_block.set()
         with self._lock:
+            if self._first_block_delay is None and self._started_at is not None:
+                self._first_block_delay = time.monotonic() - self._started_at
             # The meter keeps running past the cap: the microphone is still
             # open, so the indicator must not freeze.
             self._peak = peak
@@ -107,6 +122,20 @@ class Recorder:
                 self._capped = True
                 return
             self._chunks.append(chunk)
+
+    def wait_for_first_block(self, timeout: float) -> bool:
+        """Blocks until the stream delivers its first block, capped by timeout.
+
+        Returns whether audio arrived. A device that never delivers must not
+        hold the caller for longer than the cap.
+        """
+        return self._first_block.wait(timeout)
+
+    def first_block_delay(self) -> Optional[float]:
+        """Seconds the stream took to deliver its first block of the current
+        or last take, or None when it never delivered one."""
+        with self._lock:
+            return self._first_block_delay
 
     def peak_level(self) -> int:
         """Loudest sample of the most recent block, 0..MAX_SAMPLE.
@@ -151,6 +180,8 @@ class Recorder:
             self._capped = False
             self._stopping = False
             self._peak = 0
+            self._started_at = None
+        self._first_block.clear()
         if device_lost and not pcm:
             raise MicrophoneError("Микрофон недоступен")
         warning = None
@@ -182,6 +213,8 @@ class Recorder:
             self._capped = False
             self._stopping = False
             self._peak = 0
+            self._started_at = None
+        self._first_block.clear()
 
 
 def block_peak(pcm: bytes) -> int:

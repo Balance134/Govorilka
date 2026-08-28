@@ -11,9 +11,12 @@ import pytest
 from src.hotkey import listener as listener_module
 from src.hotkey.listener import (
     LLKHF_INJECTED,
+    MISSED_INPUT_TOLERANCE_SEC,
     WM_KEYDOWN,
     WM_KEYUP,
+    HookHealth,
     HotkeyListener,
+    reinstall_reason,
 )
 from src.hotkey.parser import (
     VK_LCONTROL,
@@ -61,7 +64,7 @@ class FakeKeyboard:
         return vk in self.down
 
 
-def make_listener(text="ctrl+alt+space", is_key_down=None):
+def make_listener(text="ctrl+alt+space", is_key_down=None, on_hook_lost=None):
     events = Recorder()
     keyboard = None
     if is_key_down is None:
@@ -75,6 +78,7 @@ def make_listener(text="ctrl+alt+space", is_key_down=None):
         events.release,
         on_cancel=events.cancel,
         is_key_down=is_key_down,
+        on_hook_lost=on_hook_lost,
     )
     listener._test_keyboard = keyboard
     return listener, events
@@ -514,3 +518,223 @@ def test_a_failing_key_state_check_keeps_the_tracked_state():
     down(listener, VK_LSHIFT)  # forces a reconciliation pass
     assert VK_RCONTROL in listener._pressed_modifier_vks
     assert events.events == ["press"]
+
+
+# ------------------------------------------ re-arming the hook after a sleep
+INSTALLED = 1_000.0  # a monotonic moment the tests build everything around
+
+
+def health(**changes):
+    """A hook installed at INSTALLED, awake, healthy, an hour of uptime."""
+    fields = dict(
+        now=INSTALLED + 3600.0,
+        installed_at=INSTALLED,
+        last_hook_event_at=INSTALLED + 3599.0,
+        last_input_at=INSTALLED + 3599.0,
+        wake_pending=False,
+        holding=False,
+    )
+    fields.update(changes)
+    return HookHealth(**fields)
+
+
+def test_a_wake_notification_forces_a_reinstall():
+    assert reinstall_reason(health(wake_pending=True)) == "wake"
+
+
+def test_a_wake_notification_wins_over_a_perfectly_healthy_hook():
+    """No liveness check first: re-arming a live hook is cheaper than a
+    guess that costs the user the hotkey until the next restart."""
+    fresh = health(
+        wake_pending=True,
+        now=INSTALLED + 1.0,
+        last_hook_event_at=INSTALLED + 1.0,
+        last_input_at=INSTALLED + 1.0,
+    )
+    assert reinstall_reason(fresh) == "wake"
+
+
+def test_an_idle_machine_is_not_a_dead_hook():
+    """Nobody has touched the keyboard for an hour - that is not evidence."""
+    idle = health(
+        last_hook_event_at=INSTALLED + 5.0,
+        last_input_at=INSTALLED + 5.0,
+        now=INSTALLED + 3600.0,
+    )
+    assert reinstall_reason(idle) is None
+
+
+def test_a_hook_that_never_saw_a_key_on_an_idle_machine_is_left_alone():
+    quiet = health(last_hook_event_at=None, last_input_at=INSTALLED - 500.0)
+    assert reinstall_reason(quiet) is None
+
+
+def test_input_the_hook_never_saw_means_the_hook_is_gone():
+    deaf = health(
+        last_hook_event_at=INSTALLED + 10.0,
+        last_input_at=INSTALLED + 10.0 + MISSED_INPUT_TOLERANCE_SEC + 1.0,
+    )
+    assert reinstall_reason(deaf) == "silent"
+
+
+def test_input_the_hook_never_saw_counts_from_the_install_too():
+    """A hook that was born dead has no event of its own to compare with."""
+    deaf = health(
+        last_hook_event_at=None,
+        last_input_at=INSTALLED + MISSED_INPUT_TOLERANCE_SEC + 1.0,
+    )
+    assert reinstall_reason(deaf) == "silent"
+
+
+def test_input_within_the_tolerance_is_not_enough():
+    lagging = health(
+        last_hook_event_at=INSTALLED + 10.0,
+        last_input_at=INSTALLED + 10.0 + MISSED_INPUT_TOLERANCE_SEC - 1.0,
+    )
+    assert reinstall_reason(lagging) is None
+
+
+def test_a_fresh_hook_is_never_blamed():
+    young = health(
+        now=INSTALLED + 1.0,
+        last_hook_event_at=None,
+        last_input_at=INSTALLED + 1.0,
+    )
+    assert reinstall_reason(young) is None
+
+
+def test_without_a_reading_of_the_system_input_nothing_is_assumed():
+    blind = health(last_hook_event_at=INSTALLED + 1.0, last_input_at=None)
+    assert reinstall_reason(blind) is None
+
+
+def test_a_dictation_in_flight_is_never_cut_short_by_the_backstop():
+    """The hold is itself proof of life: only the hook could have told us."""
+    busy = health(
+        holding=True,
+        last_hook_event_at=INSTALLED + 10.0,
+        last_input_at=INSTALLED + 10.0 + MISSED_INPUT_TOLERANCE_SEC + 100.0,
+    )
+    assert reinstall_reason(busy) is None
+
+
+def test_a_wake_still_wins_over_a_dictation_in_flight():
+    assert reinstall_reason(health(holding=True, wake_pending=True)) == "wake"
+
+
+def arm_health(listener, last_input_at, last_hook_event_at=None):
+    """Point the listener's clock and input seams at fixed moments."""
+    listener._now = lambda: INSTALLED + 3600.0
+    listener._installed_at = INSTALLED
+    listener._last_event_at = last_hook_event_at
+    listener._input_activity_at = lambda: last_input_at
+
+
+def test_the_health_check_reinstalls_and_clears_the_wake_flag():
+    listener, _ = make_listener()
+    reinstalls = []
+    listener._reinstall_hook = reinstalls.append
+    arm_health(listener, last_input_at=INSTALLED - 500.0)
+    listener._wake_pending = True
+
+    listener._check_health()
+    assert reinstalls == ["wake"]
+    assert listener._wake_pending is False
+
+    listener._check_health()  # the flag is spent, the machine is idle
+    assert reinstalls == ["wake"]
+
+
+def test_the_health_check_leaves_a_healthy_hook_alone():
+    listener, _ = make_listener()
+    listener._reinstall_hook = lambda reason: pytest.fail("re-installed: " + reason)
+    arm_health(listener, last_input_at=INSTALLED - 500.0)
+    listener._check_health()
+
+
+def test_a_take_held_across_the_sleep_is_dropped_not_resumed():
+    listener, events = make_listener()
+    down(listener, VK_LCONTROL)
+    down(listener, VK_LMENU)
+    down(listener, VK_SPACE)
+    assert events.events == ["press"]
+
+    listener._drop_take()
+    assert events.events == ["press", "cancel"]
+    assert listener._held is False
+    assert listener._pressed_modifier_vks == set()
+    assert listener._down_keys == set()
+    # Nothing phantom is left: the combination arms again from scratch.
+    down(listener, VK_LCONTROL)
+    down(listener, VK_LMENU)
+    assert down(listener, VK_SPACE) is True
+    assert events.events == ["press", "cancel", "press"]
+
+
+def test_dropping_a_take_that_is_not_running_fires_nothing():
+    listener, events = make_listener()
+    down(listener, VK_LCONTROL)
+    listener._drop_take()
+    assert events.events == []
+    assert listener._pressed_modifier_vks == set()
+
+
+def test_a_key_event_marks_the_hook_as_alive():
+    listener, _ = make_listener()
+    assert listener._last_event_at is None
+    listener._now = lambda: 42.0
+    down(listener, VK_A)  # any key at all, ours or not
+    assert listener._last_event_at == 42.0
+
+
+def test_an_injected_event_also_proves_the_hook_is_alive():
+    """It came through the hook, which is the whole question being asked."""
+    listener, _ = make_listener()
+    listener._now = lambda: 7.0
+    down(listener, VK_SPACE, flags=LLKHF_INJECTED)
+    assert listener._last_event_at == 7.0
+
+
+def test_a_failed_reinstall_reaches_the_user_and_stops_claiming_success():
+    told = []
+    listener, _ = make_listener(on_hook_lost=told.append)
+    listener._active = True
+
+    listener._report_reinstall_failure("wake", 1428)
+    assert listener.is_running is False
+    assert len(told) == 1
+    assert "1428" in told[0] and "Горячая клавиша" in told[0]
+
+
+def test_a_failed_reinstall_without_a_handler_does_not_raise():
+    listener, _ = make_listener()
+    listener._report_reinstall_failure("silent", 5)  # logged and no more
+    assert listener.is_running is False
+
+
+def test_a_broken_hook_lost_handler_does_not_take_the_thread_down():
+    def broken(message):
+        raise OSError("tray is gone")
+
+    listener, _ = make_listener(on_hook_lost=broken)
+    listener._report_reinstall_failure("wake", 5)
+    assert listener.is_running is False
+
+
+def test_a_hook_thread_that_ended_can_be_started_again(monkeypatch):
+    """A failed re-install ends the thread; the tray retry must work then."""
+    runs = []
+    listener, _ = make_listener()
+
+    def run():
+        runs.append(1)
+        listener._ready.set()
+
+    arm_for_windows(monkeypatch, listener, run)
+    listener.start()
+    listener._thread.join(timeout=1.0)
+    listener._active = False  # what _report_reinstall_failure leaves behind
+
+    listener.start()
+    assert runs == [1, 1]
+    assert listener.is_running is True

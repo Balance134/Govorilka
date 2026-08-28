@@ -222,6 +222,50 @@ def next_bar_heights(
     return tuple(bars)
 
 
+# -------------------------------------------------------------- microphone
+# How long the "speak now" beep waits for the microphone to deliver its first
+# block. Opening a WASAPI device costs tens of milliseconds on a built-in
+# microphone and far more on a Bluetooth headset; beeping before audio flows
+# tells the user to speak into a stream that is not running yet, and the first
+# words are lost. A device that never delivers must still get a cue, so the
+# wait is capped and the beep goes out anyway.
+FIRST_BLOCK_TIMEOUT_SEC = 0.4
+
+
+class AudioWait(NamedTuple):
+    """Outcome of holding the start beep until audio arrives."""
+
+    got_audio: bool
+    seconds: float
+
+
+def wait_for_first_audio(
+    wait: Callable[[float], bool],
+    timeout: float = FIRST_BLOCK_TIMEOUT_SEC,
+    clock: Callable[[], float] = time.monotonic,
+) -> AudioWait:
+    """Holds the caller until the recorder reports its first block.
+
+    `wait` is Recorder.wait_for_first_block; it returns whether audio arrived
+    before the timeout. The measured wait is what the log line reports.
+    """
+    started = clock()
+    got_audio = bool(wait(timeout))
+    return AudioWait(got_audio, max(clock() - started, 0.0))
+
+
+def format_first_audio_wait(waited: AudioWait) -> str:
+    """One INFO line per take, so the real open latency can be read off a log
+    instead of guessed."""
+    if waited.got_audio:
+        return "microphone delivered its first block after {:.0f} ms".format(
+            waited.seconds * 1000
+        )
+    return "microphone delivered no audio within {:.0f} ms, beeping anyway".format(
+        waited.seconds * 1000
+    )
+
+
 # ------------------------------------------------------------------ timings
 def format_timings(
     audio_seconds: float,
