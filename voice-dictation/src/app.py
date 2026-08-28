@@ -3,13 +3,26 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 
-from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QThread, Qt, Signal
+from PySide6.QtCore import (
+    QAbstractNativeEventFilter,
+    QObject,
+    QThread,
+    QTimer,
+    Qt,
+    Signal,
+)
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .audio import sounds
-from .audio.recorder import MicrophoneError, Recorder, is_too_short
+from .audio.recorder import (
+    MAX_DURATION_SEC,
+    MicrophoneError,
+    Recorder,
+    is_too_short,
+)
 from .config import store
 from .config.model import AppConfig
 from .config.vocabulary import apply_replacements, build_api_vocabulary
@@ -24,6 +37,42 @@ from .utils import logging_setup, single_instance
 from .utils.state import AppState, StateMachine
 
 log = logging.getLogger(__name__)
+
+# A take is force-stopped at this point (the recorder caps its buffer too).
+MAX_RECORDING_MS = int(MAX_DURATION_SEC * 1000)
+
+# Longest a single dictation may stay in PROCESSING or TYPING before the
+# watchdog frees the hotkey. Deliberately above the worst legal case (upload
+# 180 s + file activation 120 s + read 120 s + retry budget) so it only ever
+# fires when a worker signal was genuinely lost, never on a slow request.
+BUSY_TIMEOUT_MS = 480_000
+
+# How long a worker thread is given to finish while quitting. Past this the
+# process exits by itself instead of letting Qt abort on a live QThread.
+QUIT_GRACE_MS = 10_000
+
+# ERROR would otherwise be replaced by IDLE within the same event, invisible.
+ERROR_VISIBLE_MS = 1_500
+
+_IS_WINDOWS = sys.platform == "win32"
+
+if _IS_WINDOWS:
+    import ctypes
+    from ctypes import wintypes
+
+    class _MSG(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("message", wintypes.UINT),
+            ("wParam", wintypes.WPARAM),
+            ("lParam", wintypes.LPARAM),
+            ("time", wintypes.DWORD),
+            ("pt_x", wintypes.LONG),
+            ("pt_y", wintypes.LONG),
+        ]
+else:  # the filter is never installed anywhere else
+    ctypes = None  # type: ignore[assignment]
+    _MSG = None  # type: ignore[assignment]
 
 
 class TranscribeWorker(QThread):
@@ -117,24 +166,10 @@ class _ShowSettingsFilter(QAbstractNativeEventFilter):
         self._callback = callback
 
     def nativeEventFilter(self, event_type, message):  # noqa: N802 - Qt naming
-        if not self._message_id or sys.platform != "win32":
+        if not self._message_id or _MSG is None:
             return False, 0
         try:
-            import ctypes
-            from ctypes import wintypes
-
-            class MSG(ctypes.Structure):
-                _fields_ = [
-                    ("hwnd", wintypes.HWND),
-                    ("message", wintypes.UINT),
-                    ("wParam", wintypes.WPARAM),
-                    ("lParam", wintypes.LPARAM),
-                    ("time", wintypes.DWORD),
-                    ("pt_x", wintypes.LONG),
-                    ("pt_y", wintypes.LONG),
-                ]
-
-            msg = ctypes.cast(int(message), ctypes.POINTER(MSG)).contents
+            msg = ctypes.cast(int(message), ctypes.POINTER(_MSG)).contents
             if msg.message == self._message_id:
                 self._callback()
         except Exception:
@@ -146,6 +181,9 @@ class DictationApp(QObject):
     # Hook callbacks arrive on the hook thread; these signals move them to GUI.
     hotkeyPressed = Signal()
     hotkeyReleased = Signal()
+    # Unhandled errors are reported from arbitrary threads; the tray balloon
+    # may only be touched on the GUI thread, so they travel through a signal.
+    errorReported = Signal(str)
 
     def __init__(self, qt_app: QApplication) -> None:
         super().__init__()
@@ -163,21 +201,45 @@ class DictationApp(QObject):
         self._tray = TrayIcon(self)
         self._tray.settingsRequested.connect(self.show_settings)
         self._tray.exitRequested.connect(self.quit)
+        self._tray.iconActivated.connect(self._on_tray_activated)
         self._tray.show()
+
+        if self._config.was_reset:
+            self._tray.notify(
+                "Файл настроек был повреждён — настройки сброшены, "
+                "введите ключ Gemini API заново"
+            )
 
         self._settings = SettingsWindow(self._config, icon)
         self._settings.settingsSaved.connect(self._on_settings_saved)
 
-        logging_setup.set_notifier(self._tray.notify)
+        self.errorReported.connect(self._tray.notify, Qt.QueuedConnection)
+        logging_setup.set_notifier(self.errorReported.emit)
 
         self.hotkeyPressed.connect(self._start_recording, Qt.QueuedConnection)
         self.hotkeyReleased.connect(self._stop_recording, Qt.QueuedConnection)
+
+        self._recording_timer = self._make_timer(
+            MAX_RECORDING_MS, self._on_recording_timeout
+        )
+        self._busy_timer = self._make_timer(BUSY_TIMEOUT_MS, self._on_busy_timeout)
+        self._error_timer = self._make_timer(ERROR_VISIBLE_MS, self._on_error_timeout)
 
         self._listener: HotkeyListener | None = None
         self._event_filter = _ShowSettingsFilter(
             single_instance.show_settings_message_id(), self.show_settings
         )
         qt_app.installNativeEventFilter(self._event_filter)
+        # Logging out of Windows ends the loop without the tray menu: clean up
+        # there too, otherwise the hook and the microphone stay behind.
+        qt_app.aboutToQuit.connect(self._cleanup)
+
+    def _make_timer(self, interval_ms: int, slot) -> QTimer:
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(interval_ms)
+        timer.timeout.connect(slot)
+        return timer
 
     # ---------------------------------------------------------------- start
     def start(self) -> None:
@@ -214,6 +276,15 @@ class DictationApp(QObject):
         self._listener = listener
         log.info("Hotkey listener started: %s", hotkey.to_string())
 
+    def _on_tray_activated(self) -> None:
+        """Clicking the icon is the cheap way back after a failed hook."""
+        if self._shutting_down or self._listener is not None:
+            return
+        if not self._config.has_api_key():
+            return
+        log.info("Retrying the hotkey hook after a tray click")
+        self._start_listener()
+
     # ------------------------------------------------------------- settings
     def show_settings(self) -> None:
         self._settings.load_config(self._config)
@@ -222,7 +293,6 @@ class DictationApp(QObject):
         self._settings.activateWindow()
 
     def _on_settings_saved(self, config: AppConfig) -> None:
-        self._config = config
         try:
             store.save(config)
         except OSError:
@@ -231,6 +301,7 @@ class DictationApp(QObject):
                 self._settings, "Настройки", "Не удалось сохранить файл настроек."
             )
             return
+        self._config = config  # only once the file on disk agrees
         self._client.set_api_key(config.api_key)
         self._start_listener()  # re-registers or updates the hook in place
         self._tray.notify("Настройки сохранены. Говорилка работает в трее.")
@@ -245,19 +316,23 @@ class DictationApp(QObject):
         if not self._state.to(AppState.RECORDING):
             return
         self._target_hwnd = focus.get_foreground_window()
+        # Beep first: opening a WASAPI device takes up to a few hundred
+        # milliseconds and the user needs the cue when the key goes down.
+        sounds.play_start()
         try:
             self._recorder.start()
         except MicrophoneError as exc:
             self._fail(str(exc))
             return
-        sounds.play_start()
 
     def _stop_recording(self) -> None:
+        if self._shutting_down:
+            return
         if self._state.state != AppState.RECORDING:
             return
         sounds.play_stop()
         try:
-            audio = self._recorder.stop()
+            recording = self._recorder.stop()
         except MicrophoneError as exc:
             self._fail(str(exc))
             return
@@ -266,8 +341,12 @@ class DictationApp(QObject):
             self._fail("Микрофон недоступен")
             return
 
-        if is_too_short(audio):
-            self._state.to(AppState.IDLE)
+        if recording.warning:
+            # Partial audio still gets transcribed, but never silently.
+            self._tray.notify(recording.warning)
+
+        if is_too_short(recording.wav):
+            self._state.force_idle()
             self._tray.notify("Слишком короткая запись")
             return
 
@@ -276,13 +355,32 @@ class DictationApp(QObject):
 
         vocabulary = build_api_vocabulary(self._config.vocabulary, self._config.replacements)
         worker = TranscribeWorker(
-            self._client, audio, vocabulary, list(self._config.language_codes), self
+            self._client, recording.wav, vocabulary, list(self._config.language_codes), self
         )
         worker.succeeded.connect(self._on_text_ready)
         worker.failed.connect(self._fail)
+        worker.finished.connect(self._on_transcribe_finished)
         worker.finished.connect(worker.deleteLater)
         self._transcribe_worker = worker
-        worker.start()
+        try:
+            worker.start()
+        except Exception:
+            # QThread::start() does not raise on a failed thread, but if it
+            # ever does the app must not stay stuck in PROCESSING.
+            log.exception("Could not start the transcription thread")
+            self._transcribe_worker = None
+            self._fail("Не удалось начать распознавание")
+
+    def _on_recording_timeout(self) -> None:
+        if self._state.state != AppState.RECORDING:
+            return
+        log.warning("Recording hit the %.0f s cap", MAX_DURATION_SEC)
+        self._recorder.abort()
+        self._state.force_idle()
+        self._tray.notify(
+            "Запись остановлена: превышен предел 5 минут. "
+            "Похоже, отпускание клавиши не дошло до приложения."
+        )
 
     # ------------------------------------------------------------ injection
     def _on_text_ready(self, text: str) -> None:
@@ -296,44 +394,123 @@ class DictationApp(QObject):
         worker.succeeded.connect(self._on_injected)
         worker.clipboardOnly.connect(self._on_clipboard_only)
         worker.failed.connect(self._fail)
+        worker.finished.connect(self._on_inject_finished)
         worker.finished.connect(worker.deleteLater)
         self._inject_worker = worker
-        worker.start()
+        try:
+            worker.start()
+        except Exception:
+            log.exception("Could not start the injection thread")
+            self._inject_worker = None
+            self._fail("Не удалось вставить текст")
 
     def _on_injected(self) -> None:
-        self._state.to(AppState.IDLE)
+        self._state.force_idle()
 
     def _on_clipboard_only(self) -> None:
-        self._state.to(AppState.IDLE)
+        self._state.force_idle()
         self._tray.notify(
             "Не удалось определить поле ввода. Текст скопирован в буфер обмена"
         )
+
+    # ----------------------------------------------------------- worker ends
+    def _on_transcribe_finished(self) -> None:
+        # deleteLater destroys the C++ object; keeping the wrapper would make
+        # any later isRunning() raise "Internal C++ object already deleted".
+        self._transcribe_worker = None
+
+    def _on_inject_finished(self) -> None:
+        self._inject_worker = None
+
+    def _on_busy_timeout(self) -> None:
+        if not self._state.is_busy() or self._state.state is AppState.RECORDING:
+            return
+        log.error("Stuck in %s for %d ms, forcing idle", self._state.state, BUSY_TIMEOUT_MS)
+        self._state.force_idle()
+        self._tray.notify("Обработка не завершилась вовремя. Можно диктовать снова.")
 
     # ---------------------------------------------------------------- error
     def _fail(self, message: str) -> None:
         self._recorder.abort()
         self._state.to(AppState.ERROR)
         self._tray.notify(message)
-        self._state.force_idle()
+        # Leave ERROR on the tooltip for a moment instead of hiding it inside
+        # the same event; the hotkey already works again from ERROR.
+        self._error_timer.start()
+
+    def _on_error_timeout(self) -> None:
+        if self._state.state is AppState.ERROR:
+            self._state.force_idle()
 
     def _on_state_changed(self, state: AppState) -> None:
         self._tray.set_state(state)
+        self._recording_timer.stop()
+        self._busy_timer.stop()
+        if state is AppState.RECORDING:
+            self._recording_timer.start()
+        elif state in (AppState.PROCESSING, AppState.TYPING):
+            self._busy_timer.start()
+        if state is not AppState.ERROR:
+            self._error_timer.stop()
 
     # ------------------------------------------------------------- shutdown
     def quit(self) -> None:
+        self._cleanup()
+        self._qt_app.quit()
+
+    def _cleanup(self) -> None:
+        """Idempotent: runs from the tray menu and from aboutToQuit."""
         if self._shutting_down:
             return
         self._shutting_down = True
         log.info("Shutting down")
-        if self._listener is not None:
-            self._listener.stop()
-            self._listener = None
-        self._recorder.abort()
+        try:
+            self._recording_timer.stop()
+            self._busy_timer.stop()
+            self._error_timer.stop()
+            logging_setup.set_notifier(None)
+            if self._listener is not None:
+                self._listener.stop()
+                self._listener = None
+            self._recorder.abort()
+            self._qt_app.removeNativeEventFilter(self._event_filter)
+            try:
+                self._tray.settingsRequested.disconnect()
+                self._tray.exitRequested.disconnect()
+                self._tray.iconActivated.disconnect()
+                self._settings.settingsSaved.disconnect()
+            except (RuntimeError, TypeError):
+                log.debug("Signals were already disconnected", exc_info=True)
+            self._settings.close()
+            self._settings.deleteLater()
+            self._tray.hide()
+        except Exception:
+            # One broken step must not skip closing the session below.
+            log.exception("Cleanup step failed")
+        if not self._wait_for_workers():
+            self._force_exit()
+        self._client.close()  # only now: nobody is using the session anymore
+
+    def _wait_for_workers(self) -> bool:
+        """Waits for the network/injection threads. False if one is still alive."""
+        finished = True
         for worker in (self._transcribe_worker, self._inject_worker):
-            if worker is not None and worker.isRunning():
-                worker.wait(3000)
-        self._client.close()
-        self._settings.settingsSaved.disconnect()
-        self._settings.deleteLater()
-        self._tray.hide()
-        self._qt_app.quit()
+            if worker is None:
+                continue
+            try:
+                if not worker.isRunning():
+                    continue
+                if not worker.wait(QUIT_GRACE_MS):
+                    log.warning("%s did not finish in time", type(worker).__name__)
+                    finished = False
+            except RuntimeError:
+                # The C++ object is already gone, so the thread is done.
+                log.debug("Worker wrapper outlived its C++ object", exc_info=True)
+        return finished
+
+    def _force_exit(self) -> None:
+        """A live QThread at interpreter shutdown aborts the process with a
+        Windows crash dialog. Leaving on our own terms is nicer."""
+        log.warning("Leaving with a worker still running, forcing exit")
+        logging.shutdown()
+        os._exit(0)

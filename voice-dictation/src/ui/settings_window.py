@@ -23,10 +23,12 @@ from PySide6.QtWidgets import (
 from ..config.model import AppConfig, PASTE_MODES
 from ..config.vocabulary import (
     ValidationError,
+    build_api_vocabulary,
     parse_replacements_text,
     parse_vocabulary_text,
     serialize_replacements,
     serialize_vocabulary,
+    validate_replacements,
     validate_vocabulary,
     vocabulary_warnings,
 )
@@ -91,7 +93,9 @@ class SettingsWindow(QWidget):
         form.addRow("Правила замен", self.replacements_edit)
         replacements_hint = QLabel(
             "Исправляет то, что модель услышала неправильно. "
-            "Слева — как должно быть, справа — как слышится."
+            "Слева — как должно быть, справа — как слышится. "
+            "Первый знак «=» в строке делит её пополам, поэтому в левой части "
+            "знака «=» быть не должно."
         )
         replacements_hint.setWordWrap(True)
         form.addRow("", replacements_hint)
@@ -154,10 +158,12 @@ class SettingsWindow(QWidget):
         if not api_key:
             raise ValidationError("Введите ключ Gemini API")
 
-        vocabulary = validate_vocabulary(
-            parse_vocabulary_text(self.vocabulary_edit.toPlainText())
+        vocabulary = parse_vocabulary_text(self.vocabulary_edit.toPlainText())
+        replacements = validate_replacements(
+            parse_replacements_text(self.replacements_edit.toPlainText())
         )
-        replacements = parse_replacements_text(self.replacements_edit.toPlainText())
+        # Both layers land in one custom_vocabulary, so the limit is on the sum.
+        validate_vocabulary(build_api_vocabulary(vocabulary, replacements))
 
         hotkey_text = self.hotkey_edit.hotkey_text()
         hotkey = parse_hotkey(hotkey_text)  # raises HotkeyError with a message
@@ -193,7 +199,9 @@ class SettingsWindow(QWidget):
             )
             return
 
-        warnings = vocabulary_warnings(config.vocabulary)
+        warnings = vocabulary_warnings(
+            build_api_vocabulary(config.vocabulary, config.replacements)
+        )
         try:
             warnings += warnings_for(parse_hotkey(config.hotkey))
         except HotkeyError:

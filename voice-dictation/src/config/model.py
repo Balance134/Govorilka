@@ -50,6 +50,10 @@ class ReplacementRule:
             for item in variants_raw:
                 if isinstance(item, str) and item.strip():
                     variants.append(item.strip())
+        if not variants:
+            # A rule with no variants can never fire and the settings text box
+            # cannot show it, so the two layers agree to drop it here.
+            return None
         return ReplacementRule(to=to.strip(), variants=variants)
 
 
@@ -67,6 +71,8 @@ class AppConfig:
     hotkey: str = DEFAULT_HOTKEY
     language_codes: list[str] = field(default_factory=list)
     paste_mode: str = DEFAULT_PASTE_MODE
+    # Set by store.load() when a broken config.json was discarded; never saved.
+    was_reset: bool = field(default=False, compare=False, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {

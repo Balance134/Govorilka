@@ -1,16 +1,26 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller build: one file, no console window.
 
-sounddevice ships the PortAudio DLL as package data, so it is collected
-explicitly - PyInstaller does not find it on its own.
+The PortAudio DLL does NOT live inside sounddevice: sounddevice ships as a
+bare module (sounddevice.py), and the DLL sits in a separate top-level package
+_sounddevice_data/portaudio-binaries/. Collecting "sounddevice" returns nothing
+at all, so both calls point at "_sounddevice_data" instead.
 """
+
+from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
-datas = [("assets", "assets")]
-datas += collect_data_files("sounddevice")
+# Ship the icons only - make_icons.py is a build-time script, not app data.
+datas = [
+    (str(item), "assets")
+    for item in sorted(Path("assets").iterdir())
+    if item.is_file() and item.suffix != ".py"
+]
+# The DLL itself comes in as a binary below, so it is not collected twice.
+datas += collect_data_files("_sounddevice_data", excludes=["**/*.dll"])
 
-binaries = collect_dynamic_libs("sounddevice")
+binaries = collect_dynamic_libs("_sounddevice_data")
 
 hiddenimports = [
     "sounddevice",
@@ -44,7 +54,6 @@ excludes = [
     "tkinter",
     "unittest",
     "pytest",
-    "numpy",
     "matplotlib",
 ]
 

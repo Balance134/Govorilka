@@ -28,6 +28,39 @@ def test_second_press_during_processing_is_rejected():
     assert machine.state is AppState.PROCESSING
 
 
+def test_recording_counts_as_busy():
+    """A second press during recording must be rejected, not restart it."""
+    machine = StateMachine()
+    assert machine.to(AppState.RECORDING)
+    assert machine.is_busy()
+    assert not machine.to(AppState.RECORDING)
+    assert machine.state is AppState.RECORDING
+
+
+def test_idle_and_error_are_not_busy():
+    machine = StateMachine()
+    assert not machine.is_busy()
+    machine.to(AppState.RECORDING)
+    machine.to(AppState.ERROR)
+    assert not machine.is_busy()
+
+
+def test_force_idle_when_already_idle_is_silent():
+    seen = []
+    machine = StateMachine(on_change=seen.append)
+    machine.force_idle()
+    assert seen == []
+
+
+def test_watchdog_can_free_a_stuck_processing_state():
+    machine = StateMachine()
+    machine.to(AppState.RECORDING)
+    machine.to(AppState.PROCESSING)
+    machine.force_idle()  # what the busy watchdog does
+    assert not machine.is_busy()
+    assert machine.to(AppState.RECORDING)
+
+
 def test_too_short_recording_returns_to_idle():
     machine = StateMachine()
     machine.to(AppState.RECORDING)
@@ -54,10 +87,12 @@ def test_error_recovers_to_idle_and_allows_recording():
     assert machine.to(AppState.RECORDING)
 
 
-def test_same_state_transition_is_a_noop():
+def test_same_state_transition_returns_false_and_notifies_nobody():
+    """Callers must be able to tell "moved" from "was already there"."""
     seen = []
     machine = StateMachine(on_change=seen.append)
-    assert machine.to(AppState.IDLE)
+    assert not machine.to(AppState.IDLE)
+    assert machine.state is AppState.IDLE
     assert seen == []
 
 

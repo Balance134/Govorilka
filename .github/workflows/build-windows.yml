@@ -34,13 +34,26 @@ jobs:
         run: pytest -q
 
       - name: Сборка .exe
-        run: pyinstaller VoiceDictation.spec --noconfirm
+        shell: bash
+        run: |
+          set -o pipefail
+          pyinstaller VoiceDictation.spec --noconfirm 2>&1 | tee pyinstaller.log
 
       - name: Проверка результата
         shell: bash
         run: |
           test -f dist/VoiceDictation.exe
           ls -lh dist/VoiceDictation.exe
+          # Без PortAudio программа запустится и умрёт на первой же диктовке,
+          # поэтому отсутствие библиотеки — это провал сборки, а не предупреждение.
+          if grep -qi "portaudio shared library not found" pyinstaller.log; then
+            echo "PortAudio DLL не попала в сборку" >&2
+            exit 1
+          fi
+          if ! grep -rqi "libportaudio" build/VoiceDictation/*.toc; then
+            echo "PortAudio DLL не найдена в списке файлов сборки" >&2
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -53,13 +66,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete latest --yes --cleanup-tag || true
-          gh release create latest dist/VoiceDictation.exe \
-            --title "Говорилка — свежая сборка" \
-            --notes "Скачай VoiceDictation.exe и запусти. Установка не нужна, Python не нужен.
+          NOTES="Скачай VoiceDictation.exe и запусти. Установка не нужна, Python не нужен.
 
           Первый запуск: откроется окно настроек, вставь ключ Gemini API и нажми «Сохранить и запустить».
           Дальше держи Ctrl+Alt+Space, говори, отпускай — текст появится сам.
 
           Файл не подписан сертификатом, поэтому Windows покажет синее окно SmartScreen:
           «Подробнее» → «Выполнить в любом случае»."
+
+          # Релиз latest не удаляем: иначе есть окно, когда скачать нечего.
+          # Файл в нём просто заменяется, ссылка на latest продолжает работать.
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest dist/VoiceDictation.exe --clobber
+            gh release edit latest --title "Говорилка — свежая сборка" --notes "$NOTES"
+          else
+            gh release create latest dist/VoiceDictation.exe \
+              --title "Говорилка — свежая сборка" --notes "$NOTES"
+          fi

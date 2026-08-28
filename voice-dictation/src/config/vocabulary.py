@@ -12,6 +12,7 @@ from .model import ReplacementRule
 
 VOCABULARY_HARD_LIMIT = 1000
 VOCABULARY_SOFT_LIMIT = 100
+REPLACEMENTS_HARD_LIMIT = 500
 
 
 class ValidationError(ValueError):
@@ -53,6 +54,13 @@ def dedupe_terms(terms: Iterable[str]) -> list[str]:
 
 def serialize_vocabulary(terms: Iterable[str]) -> str:
     return ", ".join(terms)
+
+
+def validate_replacements(rules: list[ReplacementRule]) -> list[ReplacementRule]:
+    """Hard limit on the replacement table; every target also goes to the API."""
+    if len(rules) > REPLACEMENTS_HARD_LIMIT:
+        raise ValidationError("Правил замен больше 500 — оставьте не больше 500 строк")
+    return rules
 
 
 def validate_vocabulary(terms: list[str]) -> list[str]:
@@ -119,35 +127,71 @@ def _boundary_pattern(variant: str) -> str:
     """Word boundaries that behave for Cyrillic, digits and multi-word phrases.
 
     A plain \\b fails when a variant starts or ends with a non-word character,
-    so the guard is applied only on the sides where it makes sense.
+    so the guard is applied only on the sides where it makes sense. Whitespace
+    inside a variant matches any run of whitespace: the model may return a
+    double space or a line break between the words of a phrase.
     """
-    escaped = re.escape(variant)
+    escaped = r"\s+".join(re.escape(part) for part in variant.split())
     prefix = r"(?<!\w)" if variant[:1].isalnum() or variant[:1] == "_" else ""
     suffix = r"(?!\w)" if variant[-1:].isalnum() or variant[-1:] == "_" else ""
     return prefix + escaped + suffix
 
 
+def _variant_key(text: str) -> str:
+    """Lookup key shared by a variant and the text that matched it."""
+    return " ".join(text.split()).casefold()
+
+
+def _apply_casing(matched: str, target: str) -> str:
+    """Keep a lowercase target from lowercasing the start of a sentence.
+
+    Only the first character is ever touched, and only when the target is
+    itself all-lowercase - casing like "Claude Code" is deliberate and stays
+    verbatim. ALL-CAPS input is treated exactly like a capitalised word: the
+    model shouting is not a reason to shout the target back, and an all-caps
+    brand would be wrong anyway.
+    """
+    if not matched[:1].isupper() or not target.islower():
+        return target
+    return target[:1].upper() + target[1:]
+
+
 def apply_replacements(text: str, rules: Iterable[ReplacementRule]) -> str:
     """Case-insensitive replacement; the target's own casing is written out.
 
-    Longer variants are matched first so that "клод код" is not eaten by "клод".
+    One pass over the text with a single alternation: every rule sees the
+    ORIGINAL text, so rules can never cascade into each other (a swap pair
+    "пёс = кот" / "кот = пёс" really swaps). Longer variants come first in the
+    alternation, which gives leftmost-longest matching.
     """
     if not text:
         return text
     pairs: list[tuple[str, str]] = []
     for rule in rules:
         for variant in rule.variants:
-            if variant:
+            if variant.strip():
                 pairs.append((variant, rule.to))
     if not pairs:
         return text
     pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
 
-    result = text
+    targets: dict[str, str] = {}
+    alternatives: list[str] = []
     for variant, target in pairs:
-        pattern = re.compile(_boundary_pattern(variant), re.IGNORECASE | re.UNICODE)
-        result = pattern.sub(lambda _m, value=target: value, result)
-    return result
+        key = _variant_key(variant)
+        if key in targets:
+            continue  # the longer, earlier rule already claimed this spelling
+        targets[key] = target
+        alternatives.append(_boundary_pattern(variant))
+
+    pattern = re.compile("|".join(alternatives), re.IGNORECASE | re.UNICODE)
+
+    def substitute(match: "re.Match[str]") -> str:
+        matched = match.group(0)
+        # Written literally: a target containing \1 must not become a backreference.
+        return _apply_casing(matched, targets[_variant_key(matched)])
+
+    return pattern.sub(substitute, text)
 
 
 # --------------------------------------------------------------------------

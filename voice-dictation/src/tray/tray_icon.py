@@ -46,6 +46,7 @@ def app_icon() -> QIcon:
 class TrayIcon(QObject):
     settingsRequested = Signal()
     exitRequested = Signal()
+    iconActivated = Signal()
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -79,5 +80,6 @@ class TrayIcon(QObject):
         self._tray.showMessage(title, message, self._icons[AppState.IDLE], 4000)
 
     def _on_activated(self, reason) -> None:
+        self.iconActivated.emit()
         if reason in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger):
             self.settingsRequested.emit()

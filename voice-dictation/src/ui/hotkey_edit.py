@@ -43,7 +43,6 @@ for _i in range(1, 25):
 class HotkeyEdit(QLineEdit):
     """Shows a combination string; typing into it is impossible by design."""
 
-    hotkeyChanged = Signal(str)
     captureFailed = Signal(str)
 
     def __init__(self, hotkey_text: str, parent=None) -> None:
@@ -92,7 +91,6 @@ class HotkeyEdit(QLineEdit):
 
         self._hotkey = hotkey
         self.setText(hotkey.to_string())
-        self.hotkeyChanged.emit(hotkey.to_string())
         event.accept()
 
     def keyReleaseEvent(self, event: QKeyEvent) -> None:  # noqa: N802 - Qt naming

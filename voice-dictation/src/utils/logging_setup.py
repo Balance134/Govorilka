@@ -31,8 +31,12 @@ def setup(level: int = logging.INFO) -> None:
     root.addHandler(handler)
 
 
-def set_notifier(notifier: Callable[[str], None]) -> None:
-    """Where unhandled errors are reported to the user (tray balloon)."""
+def set_notifier(notifier: Optional[Callable[[str], None]]) -> None:
+    """Where unhandled errors are reported to the user.
+
+    Called from any thread by the excepthooks, so the coordinator registers a
+    queued signal here, never a widget method. None clears it on shutdown.
+    """
     global _notifier
     _notifier = notifier
 

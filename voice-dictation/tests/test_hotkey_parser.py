@@ -92,3 +92,38 @@ def test_from_parts_matches_parse():
     assert from_parts(["ctrl", "alt"], 0x20).to_string() == "ctrl+alt+space"
     with pytest.raises(HotkeyError):
         from_parts([], 0x20)
+
+
+@pytest.mark.parametrize("text", ["ctrl+capslock", "ctrl+numlock", "alt+scrolllock"])
+def test_lock_keys_are_rejected_as_the_main_key(text):
+    with pytest.raises(HotkeyError, match="режим клавиатуры"):
+        parse(text)
+
+
+def test_printscreen_is_rejected_as_the_main_key():
+    with pytest.raises(HotkeyError, match="Windows"):
+        parse("ctrl+printscreen")
+
+
+def test_lock_keys_are_rejected_from_the_capture_widget_too():
+    with pytest.raises(HotkeyError):
+        from_parts(["ctrl"], 0x14)
+
+
+def test_lock_keys_stay_usable_as_modifier_free_names():
+    # The token itself is still known, only its use as the main key is barred.
+    assert key_token_to_vk("capslock") == 0x14
+
+
+def test_plus_key_is_expressible_by_name():
+    hotkey = parse("ctrl+plus")
+    assert hotkey.key_vk == 0xBB
+
+
+def test_missing_key_error_mentions_the_plus_workaround():
+    with pytest.raises(HotkeyError, match="plus"):
+        parse("ctrl++")
+
+
+def test_equals_sign_stays_the_canonical_name_for_that_key():
+    assert vk_to_key_token(0xBB) == "="

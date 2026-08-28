@@ -1,0 +1,223 @@
+"""Decision logic of the keyboard hook, driven with plain integers.
+
+Nothing here touches Win32: the listener is built but never started, and only
+``_handle_key`` (the pure part of the callback) is exercised.
+"""
+
+import threading
+
+from src.hotkey.listener import (
+    LLKHF_INJECTED,
+    WM_KEYDOWN,
+    WM_KEYUP,
+    HotkeyListener,
+)
+from src.hotkey.parser import (
+    VK_LCONTROL,
+    VK_LMENU,
+    VK_LSHIFT,
+    VK_RSHIFT,
+    parse,
+)
+
+VK_SPACE = 0x20
+VK_F9 = 0x78
+VK_A = 0x41
+
+
+class Recorder:
+    def __init__(self):
+        self.events: list[str] = []
+
+    def press(self):
+        self.events.append("press")
+
+    def release(self):
+        self.events.append("release")
+
+
+def make_listener(text="ctrl+alt+space"):
+    events = Recorder()
+    listener = HotkeyListener(parse(text), events.press, events.release)
+    return listener, events
+
+
+def down(listener, vk, flags=0):
+    return listener._handle_key(vk, WM_KEYDOWN, flags)
+
+
+def up(listener, vk, flags=0):
+    return listener._handle_key(vk, WM_KEYUP, flags)
+
+
+# ------------------------------------------------------------- baseline
+def test_press_and_release_fire_once_and_are_swallowed():
+    listener, events = make_listener()
+    down(listener, VK_LCONTROL)
+    down(listener, VK_LMENU)
+    assert down(listener, VK_SPACE) is True
+    assert down(listener, VK_SPACE) is True  # auto-repeat
+    assert events.events == ["press"]
+    assert up(listener, VK_SPACE) is True
+    assert events.events == ["press", "release"]
+
+
+def test_key_without_modifiers_is_passed_through():
+    listener, events = make_listener()
+    assert down(listener, VK_SPACE) is False
+    assert events.events == []
+
+
+def test_releasing_a_required_modifier_ends_the_hold():
+    listener, events = make_listener()
+    down(listener, VK_LCONTROL)
+    down(listener, VK_LMENU)
+    down(listener, VK_SPACE)
+    up(listener, VK_LMENU)
+    assert events.events == ["press", "release"]
+
+
+# ------------------------------------- item 1: foreign modifiers are tracked
+def test_extra_modifier_family_blocks_the_hotkey():
+    listener, events = make_listener()
+    down(listener, VK_LCONTROL)
+    down(listener, VK_LMENU)
+    down(listener, VK_LSHIFT)
+    assert down(listener, VK_SPACE) is False
+    assert events.events == []
+
+
+def test_hotkey_works_again_after_the_extra_modifier_is_released():
+    listener, events = make_listener()
+    down(listener, VK_LCONTROL)
+    down(listener, VK_LMENU)
+    down(listener, VK_LSHIFT)
+    down(listener, VK_SPACE)
+    up(listener, VK_SPACE)
+    up(listener, VK_LSHIFT)
+    assert down(listener, VK_SPACE) is True
+    assert events.events == ["press"]
+
+
+def test_releasing_a_foreign_modifier_does_not_end_the_hold():
+    listener, events = make_listener()
+    down(listener, VK_LCONTROL)
+    down(listener, VK_LMENU)
+    down(listener, VK_SPACE)
+    down(listener, VK_RSHIFT)
+    up(listener, VK_RSHIFT)
+    assert events.events == ["press"]
+    up(listener, VK_SPACE)
+    assert events.events == ["press", "release"]
+
+
+# --------------------------------------------- item 3: injected input ignored
+def test_injected_key_does_not_start_dictation():
+    listener, events = make_listener()
+    down(listener, VK_LCONTROL)
+    down(listener, VK_LMENU)
+    assert down(listener, VK_SPACE, flags=LLKHF_INJECTED) is False
+    assert events.events == []
+
+
+def test_injected_modifier_does_not_change_the_tracked_state():
+    listener, events = make_listener()
+    down(listener, VK_LCONTROL)
+    down(listener, VK_LMENU)
+    down(listener, VK_SPACE)
+    # The app's own SendInput releases the modifiers before pasting.
+    up(listener, VK_LCONTROL, flags=LLKHF_INJECTED)
+    up(listener, VK_LMENU, flags=LLKHF_INJECTED)
+    assert events.events == ["press"]
+    assert listener._pressed_modifier_vks == {VK_LCONTROL, VK_LMENU}
+
+
+# ------------------------------------ item 5: callbacks fire outside the lock
+def test_callback_runs_without_the_lock_held():
+    listener, events = make_listener()
+    seen: list[bool] = []
+
+    def on_press():
+        seen.append(listener._lock.acquire(blocking=False))
+        if seen[-1]:
+            listener._lock.release()
+        events.press()
+
+    listener._on_press = on_press
+    down(listener, VK_LCONTROL)
+    down(listener, VK_LMENU)
+    down(listener, VK_SPACE)
+    assert seen == [True]
+
+
+def test_set_hotkey_is_not_blocked_by_a_slow_callback():
+    listener, events = make_listener()
+    inside = threading.Event()
+    finished = threading.Event()
+
+    def on_press():
+        inside.set()
+        finished.wait(timeout=10.0)
+        events.press()
+
+    listener._on_press = on_press
+    down(listener, VK_LCONTROL)
+    down(listener, VK_LMENU)
+    worker = threading.Thread(target=lambda: down(listener, VK_SPACE))
+    worker.start()
+    assert inside.wait(timeout=2.0)
+    switched = threading.Thread(target=listener.set_hotkey, args=(parse("ctrl+f9"),))
+    switched.start()
+    switched.join(timeout=1.0)
+    assert not switched.is_alive()  # the GUI thread was not stuck on the lock
+    finished.set()
+    worker.join(timeout=2.0)
+
+
+# ------------------------------- item 6: no phantom start after a hotkey swap
+def test_switching_to_a_bare_key_does_not_arm_on_auto_repeat():
+    listener, events = make_listener("ctrl+f9")
+    down(listener, VK_LCONTROL)
+    down(listener, VK_F9)
+    assert events.events == ["press"]
+
+    listener.set_hotkey(parse("f9"))
+    assert events.events == ["press", "release"]
+    up(listener, VK_LCONTROL)  # Ctrl is no longer part of the combination
+
+    down(listener, VK_F9)  # auto-repeat of the key still physically held
+    down(listener, VK_F9)
+    assert events.events == ["press", "release"]
+
+    up(listener, VK_F9)
+    assert down(listener, VK_F9) is True
+    assert events.events == ["press", "release", "press"]
+
+
+def test_key_held_before_arming_needs_a_real_press():
+    listener, events = make_listener()
+    down(listener, VK_SPACE)  # space alone, nothing armed
+    down(listener, VK_LCONTROL)
+    down(listener, VK_LMENU)
+    assert down(listener, VK_SPACE) is False  # still the same physical press
+    assert events.events == []
+    up(listener, VK_SPACE)
+    assert down(listener, VK_SPACE) is True
+    assert events.events == ["press"]
+
+
+# ------------------------------------------------------------- housekeeping
+def test_other_keys_are_ignored():
+    listener, events = make_listener()
+    assert down(listener, VK_A) is False
+    assert up(listener, VK_A) is False
+    assert events.events == []
+
+
+def test_callback_exception_does_not_break_the_hook():
+    listener, _ = make_listener()
+    listener._on_press = lambda: 1 / 0
+    down(listener, VK_LCONTROL)
+    down(listener, VK_LMENU)
+    assert down(listener, VK_SPACE) is True
+    assert up(listener, VK_SPACE) is True

@@ -92,6 +92,7 @@ NAMED_KEYS: dict[str, int] = {
     "scrolllock": 0x91,
     ";": 0xBA,
     "=": 0xBB,
+    "plus": 0xBB,  # the format splits on "+", so the key needs a name
     ",": 0xBC,
     "-": 0xBD,
     ".": 0xBE,
@@ -118,6 +119,12 @@ for _c in "0123456789":
 
 # Single keys usable without any modifier.
 STANDALONE_KEYS = {f"f{i}" for i in range(1, 25)}
+
+# Keys that must not be the main key: held down for dictation they toggle a
+# keyboard lock or fire a system action, and the capture widget never
+# produces them either.
+LOCK_KEYS = {"capslock", "numlock", "scrolllock"}
+UNUSABLE_MAIN_KEYS = LOCK_KEYS | {"printscreen"}
 
 
 class HotkeyError(ValueError):
@@ -188,7 +195,10 @@ def parse(text: str) -> Hotkey:
         key_token = token
 
     if key_token is None:
-        raise HotkeyError("В комбинации нет обычной клавиши")
+        raise HotkeyError(
+            "В комбинации нет обычной клавиши "
+            "(клавишу «+» записывайте словом plus)"
+        )
 
     vk = key_token_to_vk(key_token)
     if vk is None:
@@ -198,8 +208,22 @@ def parse(text: str) -> Hotkey:
         raise HotkeyError("Нужен хотя бы один модификатор (Ctrl, Alt, Shift или Win)")
 
     hotkey = Hotkey(modifiers=_sort_modifiers(modifiers), key=key_token, key_vk=vk)
+    _reject_unusable_key(hotkey)
     _reject_system_combinations(hotkey)
     return hotkey
+
+
+def _reject_unusable_key(hotkey: Hotkey) -> None:
+    if hotkey.key in LOCK_KEYS:
+        raise HotkeyError(
+            f"Клавиша {hotkey.key} не подходит для диктовки — "
+            "её удержание переключает режим клавиатуры"
+        )
+    if hotkey.key in UNUSABLE_MAIN_KEYS:
+        raise HotkeyError(
+            f"Клавиша {hotkey.key} не подходит для диктовки — "
+            "её обрабатывает сама Windows"
+        )
 
 
 def _reject_system_combinations(hotkey: Hotkey) -> None:
@@ -233,5 +257,6 @@ def from_parts(modifier_names: Iterable[str], key_vk: int) -> Hotkey:
     if not normalised and token not in STANDALONE_KEYS:
         raise HotkeyError("Нужен хотя бы один модификатор (Ctrl, Alt, Shift или Win)")
     hotkey = Hotkey(modifiers=_sort_modifiers(normalised), key=token, key_vk=key_vk)
+    _reject_unusable_key(hotkey)
     _reject_system_combinations(hotkey)
     return hotkey

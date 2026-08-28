@@ -6,6 +6,7 @@ from src.config.vocabulary import (
     build_api_vocabulary,
     parse_vocabulary_text,
     serialize_vocabulary,
+    validate_replacements,
     validate_vocabulary,
     vocabulary_warnings,
 )
@@ -57,3 +58,20 @@ def test_api_vocabulary_merges_both_layers_without_duplicates():
     merged = build_api_vocabulary(["Supabase", "claude code"], rules)
     assert merged == ["Supabase", "claude code", "n8n"]
     assert len([t for t in merged if t.casefold() == "claude code"]) == 1
+
+
+def test_combined_list_is_what_the_limits_see():
+    vocabulary = [f"term{i}" for i in range(90)]
+    rules = [ReplacementRule(f"rule{i}", [f"вариант{i}"]) for i in range(600)]
+    merged = build_api_vocabulary(vocabulary, rules)
+    assert len(merged) == 690
+    assert vocabulary_warnings(merged)
+    many = [ReplacementRule(f"rule{i}", [f"вариант{i}"]) for i in range(1000)]
+    with pytest.raises(ValidationError, match="более 1000"):
+        validate_vocabulary(build_api_vocabulary(vocabulary, many))
+
+
+def test_replacement_limit_is_separate_from_the_vocabulary_limit():
+    rules = [ReplacementRule(f"rule{i}", [f"вариант{i}"]) for i in range(501)]
+    with pytest.raises(ValidationError, match="больше 500"):
+        validate_replacements(rules)

@@ -1,5 +1,8 @@
 import base64
+import importlib
 import json
+import sys
+import types
 
 import pytest
 
@@ -31,8 +34,17 @@ def test_mode_is_the_string_smart():
     assert isinstance(config["mode"], str)
 
 
-def test_smart_mode_incompatible_fields_are_absent():
-    payload = json.dumps(body())
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"audio_b64": "QUJD"},
+        {"audio_b64": None, "file_uri": "files/abc"},
+    ],
+)
+def test_smart_mode_incompatible_fields_are_absent(kwargs):
+    built = body(**kwargs)
+    payload = json.dumps(built)
+    assert built["generation_config"]["transcription_config"]["mode"] == "smart"
     assert "timestamp_granularities" not in payload
     assert "diarization_mode" not in payload
 
@@ -112,3 +124,45 @@ def test_transcribe_without_key_is_an_auth_error():
 
     with pytest.raises(AuthError):
         gemini_client.GeminiClient("").transcribe(b"x", [], [])
+
+
+def test_audio_mime_matches_what_the_recorder_produces(monkeypatch):
+    """The recorder writes a plain PCM WAV container - audio/wav, nothing else."""
+    monkeypatch.setitem(sys.modules, "sounddevice", types.ModuleType("sounddevice"))
+    recorder = importlib.import_module("src.audio.recorder")
+
+    wav_bytes = recorder.encode_wav(b"\x00\x01" * 64)
+    assert wav_bytes[:4] == b"RIFF"
+    assert wav_bytes[8:12] == b"WAVE"
+    assert gemini_client.AUDIO_MIME == "audio/wav"
+
+
+def test_both_upload_calls_carry_a_timeout(monkeypatch):
+    calls = []
+
+    class _Start:
+        status_code = 200
+        text = ""
+        headers = {"x-goog-upload-url": "https://upload.example/session"}
+
+        def json(self):
+            return {}
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        if url == gemini_client.UPLOAD_URL:
+            return _Start()
+        if url == "https://upload.example/session":
+            return _FakeResponse(payload={"file": {"uri": "files/abc", "name": "files/abc"}})
+        return _FakeResponse()
+
+    client = gemini_client.GeminiClient("key")
+    monkeypatch.setattr(client._session, "post", fake_post)
+    monkeypatch.setattr(client._session, "delete", lambda *a, **k: _FakeResponse())
+    monkeypatch.setattr(gemini_client, "INLINE_LIMIT_BYTES", 10)
+
+    assert client.transcribe(b"x" * 100, [], []) == "привет"
+    start_kwargs = calls[0][1]
+    finish_kwargs = calls[1][1]
+    assert start_kwargs["timeout"] == (10, 120)
+    assert finish_kwargs["timeout"] == (10, 180)
